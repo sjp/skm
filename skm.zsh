@@ -1,0 +1,439 @@
+#!/usr/bin/env zsh
+# skm — a small per-host SSH key manager.  (zsh port)
+#
+# Each host gets:  its own key, its own ~/.ssh/config.d/<name>.conf
+# Optionally:      the private key stored in KeePassXC and removed from disk.
+#
+#   skm add <name> <user@host> [port]   generate key + config entry
+#   skm alias <name> <pattern>...       let more names/IPs/globs use this key
+#   skm list                            show managed hosts
+#   skm show <name>                     print the public key
+#   skm copy <name>                     ssh-copy-id the key to the server
+#   skm rm <name>                       delete key + config entry
+#   skm export <name|--all> <db.kdbx>   import key into KeePassXC as an agent key
+#   skm agent <name>                    point IdentityFile at the .pub (agent supplies private)
+#   skm ondisk <name>                   undo `agent`
+#   skm scope <label> [-c] [-t 8h] [-d db.kdbx] <name>...
+#                                       start an agent holding ONLY those keys
+#   skm scopes                          list scoped agents and what's in them
+#   skm unscope <label>                 kill a scoped agent
+
+# Must be POSIX — it has to survive being run by sh/bash in order to complain
+# about being run by sh/bash.
+[ -n "${ZSH_VERSION:-}" ] || { echo "skm: must be run with zsh (try: zsh skm ...)" >&2; exit 1; }
+
+# emulate -L zsh gives us zsh's native semantics regardless of what the user has
+# in ~/.zshrc — notably NO word splitting on unquoted parameters, so "$var" and
+# $var behave the same and there is no IFS minefield.
+emulate -L zsh
+setopt err_exit no_unset pipe_fail
+
+SSH_DIR="${SSH_DIR:-$HOME/.ssh}"
+CONF_DIR="$SSH_DIR/config.d"
+CONFIG="$SSH_DIR/config"
+SOCK_DIR="$SSH_DIR/agents"
+KP_GROUP="${SKM_KEEPASS_GROUP:-SSH Keys}"
+
+die()  { print -u2 "skm: $*"; exit 1 }
+info() { print "  $*" }
+
+# ---------------------------------------------------------------- bootstrap
+
+ensure_include() {
+    mkdir -p "$CONF_DIR"
+    chmod 700 "$SSH_DIR" "$CONF_DIR"
+    [[ -f $CONFIG ]] || { : > "$CONFIG"; chmod 600 "$CONFIG" }
+
+    # Include must sit at the very top: ssh_config is first-match-wins, so a
+    # later Include would be shadowed by any earlier catch-all Host block.
+    if ! grep -qE '^[[:space:]]*Include[[:space:]]+config\.d/' "$CONFIG"; then
+        print -r -- "Include config.d/*.conf" > "$CONFIG.tmp"
+        print >> "$CONFIG.tmp"
+        cat "$CONFIG" >> "$CONFIG.tmp"
+        mv "$CONFIG.tmp" "$CONFIG"
+        chmod 600 "$CONFIG"
+        info "added 'Include config.d/*.conf' to $CONFIG"
+    fi
+}
+
+keyfile()  { print -r -- "$SSH_DIR/id_ed25519_$1" }
+conffile() { print -r -- "$CONF_DIR/$1.conf" }
+
+require_host() {
+    [[ -f $(conffile "$1") ]] || die "no such managed host: $1  (try: skm list)"
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_add() {
+    local name=${1:-} dest=${2:-} port=${3:-22}
+    [[ -n $name && -n $dest ]] || die "usage: skm add <name> <user@host> [port]"
+    [[ $dest == *@* ]]         || die "destination must be user@host, e.g. git@github.com"
+
+    local user=${dest%@*} host=${dest#*@}
+    local key=$(keyfile "$name")
+    local conf=$(conffile "$name")
+
+    ensure_include
+    [[ -e $key  ]] && die "key already exists: $key"
+    [[ -e $conf ]] && die "host already managed: $name"
+
+    info "generating key (leave the passphrase empty only if you'll store it in KeePassXC)"
+    ssh-keygen -t ed25519 -f "$key" -C "$name@$(hostname -s)-$(date +%Y%m%d)"
+
+    cat > "$conf" <<EOF
+# managed by skm
+Host $name
+    HostName $host
+    User $user
+    Port $port
+    IdentityFile $key
+    IdentitiesOnly yes
+    # Reuse one authenticated connection for 10 minutes. Repeat 'ssh $name'
+    # calls ride the existing master and never re-ask the agent — so a locked
+    # KeePassXC vault doesn't interrupt an active session.
+    ControlMaster auto
+    ControlPath ~/.ssh/cm/%r@%h:%p
+    ControlPersist 10m
+EOF
+    chmod 600 "$conf"
+    mkdir -p "$SSH_DIR/cm"; chmod 700 "$SSH_DIR/cm"
+
+    print
+    info "created $conf"
+    info "public key:"
+    print
+    cat "$key.pub"
+    print
+    info "install it with:  skm copy $name"
+}
+
+# `Host` takes a list of patterns, so extra domains / IPs / globs can share a
+# key just by being appended to that line. HostName stays pinned to the
+# canonical address, which keeps everything under one known_hosts entry.
+cmd_alias() {
+    local name=${1:-}
+    (( $# > 1 )) || die "usage: skm alias <name> <pattern> [pattern...]"
+    shift
+    require_host "$name"
+
+    local conf=$(conffile "$name")
+    local existing=$(awk '$1=="Host"{sub(/^[ \t]*Host[ \t]+/,""); print; exit}' "$conf")
+
+    local p
+    local -a add=()
+    for p in "$@"; do
+        [[ " $existing " == *" $p "* ]] || add+=("$p")
+    done
+    if (( ${#add} == 0 )); then
+        info "already matched by: Host $existing"
+        return
+    fi
+
+    sed -i.bak "s|^\([ 	]*Host[ 	]\{1,\}\).*|\1$existing ${add[*]}|" "$conf"
+    rm -f "$conf.bak"
+    info "Host $existing ${add[*]}"
+}
+
+cmd_list() {
+    [[ -d $CONF_DIR ]] || die "nothing managed yet"
+    local f name target id agent
+    print -f '%-14s %-28s %s\n' NAME TARGET KEY
+    # (N) is zsh's nullglob qualifier: an empty directory yields zero
+    # iterations instead of a literal '*.conf'.
+    for f in $CONF_DIR/*.conf(N); do
+        name=${f:t:r}                       # :t = tail, :r = strip extension
+        target=$(awk '$1=="User"{u=$2} $1=="HostName"{h=$2} $1=="Port"{p=$2} \
+                      END{printf "%s@%s%s", u, h, (p=="22"?"":":" p)}' "$f")
+        id=$(awk '$1=="IdentityFile"{print $2}' "$f")
+        agent=""
+        [[ $id == *.pub ]] && agent="  (agent)"
+        print -f '%-14s %-28s %s%s\n' "$name" "$target" "${id:t}" "$agent"
+    done
+}
+
+cmd_show() { require_host "$1"; cat "$(keyfile "$1").pub" }
+
+cmd_copy() {
+    require_host "$1"
+    ssh-copy-id -i "$(keyfile "$1").pub" "$1"
+}
+
+cmd_rm() {
+    local name=${1:-}
+    [[ -n $name ]] || die "usage: skm rm <name>"
+    require_host "$name"
+
+    # zsh's read takes the prompt as name?prompt. Do NOT use bash's `read -rp`:
+    # in zsh, -p means "read from the coprocess" and silently reads nothing.
+    # The `||` matters: under err_exit, an EOF (piped/non-interactive) makes
+    # read return non-zero, which would otherwise kill the script mid-way.
+    local ans=""
+    read -r "ans?delete key and config for '$name'? [y/N] " || ans=""
+    case $ans in
+        [yY]*) ;;
+        *) info "aborted"; return ;;
+    esac
+
+    rm -f "$(conffile "$name")" "$(keyfile "$name")" "$(keyfile "$name").pub"
+    info "removed $name"
+}
+
+# Swap IdentityFile between the private key on disk and the .pub stub.
+# With the .pub, ssh asks the agent (KeePassXC) for the matching private key —
+# so the private key never has to exist on disk at all.
+retarget() {
+    local name=$1 to=$2
+    local conf=$(conffile "$name")
+    local key=$(keyfile "$name")
+    case $to in
+        agent)  sed -i.bak "s|^\([ 	]*IdentityFile[ 	]\{1,\}\).*|\1$key.pub|" "$conf" ;;
+        ondisk) sed -i.bak "s|^\([ 	]*IdentityFile[ 	]\{1,\}\).*|\1$key|"     "$conf" ;;
+    esac
+    rm -f "$conf.bak"
+}
+
+cmd_agent() {
+    require_host "$1"
+    retarget "$1" agent
+    info "$1 now resolves its key via the ssh-agent"
+    if (( $+commands[shred] )); then            # zsh: $+commands[x] tests PATH
+        info "once verified: shred -u $(keyfile "$1")"
+    else
+        info "once verified: rm -P $(keyfile "$1")"    # BSD/macOS
+    fi
+}
+
+cmd_ondisk() {
+    require_host "$1"
+    retarget "$1" ondisk
+    info "$1 now reads $(keyfile "$1") directly"
+}
+
+# ---------------------------------------------------------------- keepassxc
+
+# On macOS, keepassxc-cli ships inside the app bundle and isn't on PATH unless
+# you installed via Homebrew. Find it either way.
+kp_bin() {
+    if (( $+commands[keepassxc-cli] )); then
+        print -r -- $commands[keepassxc-cli]
+    elif [[ -x /Applications/KeePassXC.app/Contents/MacOS/keepassxc-cli ]]; then
+        print -r -- /Applications/KeePassXC.app/Contents/MacOS/keepassxc-cli
+    else
+        die "keepassxc-cli not found (macOS: it lives in KeePassXC.app/Contents/MacOS)"
+    fi
+}
+
+# KeePassXC's agent reads two attachments from an entry:
+#   - the private key itself
+#   - KeeAgent.settings, an XML blob (inherited from the KeePass KeeAgent
+#     plugin) that says "yes, this is an SSH key, load it on unlock"
+keeagent_xml() {
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<EntrySettings>
+    <AllowUseOfSshKey>true</AllowUseOfSshKey>
+    <AddAtDatabaseOpen>true</AddAtDatabaseOpen>
+    <RemoveAtDatabaseClose>true</RemoveAtDatabaseClose>
+    <UseConfirmConstraint>false</UseConfirmConstraint>
+    <UseLifetimeConstraintWhenAdding>false</UseLifetimeConstraintWhenAdding>
+    <LifetimeConstraintDuration>600</LifetimeConstraintDuration>
+    <Location>
+        <SelectedType>attachment</SelectedType>
+        <AttachmentName>$1</AttachmentName>
+        <SaveAttachmentToTempFile>false</SaveAttachmentToTempFile>
+        <FileName></FileName>
+    </Location>
+</EntrySettings>
+EOF
+}
+
+# keepassxc-cli reads the database password from stdin, so we hand it the same
+# password for each subcommand rather than prompting five times.
+run_kp() {
+    print -r -- "$KP_PW" | "$KP_CLI" "$@" >/dev/null
+}
+
+export_one() {
+    local name=$1
+    local db=$2
+    local key=$(keyfile "$name")
+    local entry="$KP_GROUP/$name"
+    local base=${key:t}
+
+    [[ -f $key ]] || die "no private key on disk for '$name' (already exported?)"
+
+    run_kp mkdir "$db" "$KP_GROUP" 2>/dev/null || true
+    run_kp add   "$db" "$entry" --url "ssh://$name" 2>/dev/null \
+        || info "entry '$entry' exists, updating attachments"
+
+    local tmp=$(mktemp "${TMPDIR:-/tmp}/skm.XXXXXX")   # BSD mktemp needs a template
+    keeagent_xml "$base" > "$tmp"
+
+    run_kp attachment-import "$db" "$entry" "$base"             "$key"
+    run_kp attachment-import "$db" "$entry" "KeeAgent.settings" "$tmp"
+    rm -f "$tmp"
+
+    info "exported $name -> $entry"
+}
+
+cmd_export() {
+    local what=${1:-} db=${2:-}
+    [[ -n $what && -n $db ]] || die "usage: skm export <name|--all> <database.kdbx>"
+    [[ -f $db ]] || die "no such database: $db"
+
+    typeset -g KP_CLI=$(kp_bin)
+    typeset -g KP_PW=""
+    read -rs "KP_PW?KeePassXC database password: " || die "no password given"
+    print   # -s ate the newline
+
+    local f
+    if [[ $what == --all ]]; then
+        for f in $CONF_DIR/*.conf(N); do export_one "${f:t:r}" "$db"; done
+    else
+        require_host "$what"
+        export_one "$what" "$db"
+    fi
+    unset KP_PW
+
+    print
+    info "next: in KeePassXC, enable Tools > Settings > SSH Agent, then re-unlock the database."
+    info "the entry's Password field must hold the key's passphrase, or it can't decrypt it."
+    info "verify with 'ssh-add -l', then run 'skm agent <name>' and delete the on-disk key."
+}
+
+# ---------------------------------------------------------------- scoping
+
+# An agent that holds one key can only ever be asked to sign with that key.
+# So instead of forwarding your whole agent into a devcontainer, run a second
+# agent containing just the key that container legitimately needs, and mount
+# only its socket. Everything else is unreachable — not "denied", but absent.
+
+cmd_scope() {
+    local label=${1:-}
+    [[ -n $label ]] || die "usage: skm scope <label> [-c] [-t 8h] [-d db.kdbx] <name>..."
+    shift
+
+    local confirm=0 ttl="" db=""
+    local -a names=()
+    while (( $# > 0 )); do
+        case $1 in
+            -c|--confirm) confirm=1;     shift ;;
+            -t|--ttl)     ttl=${2:?};    shift 2 ;;
+            -d|--db)      db=${2:?};     shift 2 ;;
+            -*)           die "unknown flag: $1" ;;
+            *)            names+=("$1"); shift ;;
+        esac
+    done
+    (( ${#names} > 0 )) || die "name at least one key to put in the agent"
+
+    mkdir -p "$SOCK_DIR"; chmod 700 "$SOCK_DIR"
+    local sock="$SOCK_DIR/$label.sock"
+
+    if [[ -S $sock ]] && SSH_AUTH_SOCK="$sock" ssh-add -l >/dev/null 2>&1; then
+        die "scope '$label' is already running (skm unscope $label to replace it)"
+    fi
+    rm -f "$sock"
+
+    # The agent inherits SSH_ASKPASS/DISPLAY from *this* shell, and it's the
+    # agent that renders the -c confirmation dialog. Start it from a graphical
+    # session or the prompt will never appear.
+    eval "$(ssh-agent -a "$sock")" >/dev/null
+    export SSH_AUTH_SOCK="$sock"
+    print -r -- "${SSH_AGENT_PID:-}" > "$SOCK_DIR/$label.pid"
+
+    # An empty array expands to zero words here — no bash-3.2-style landmine.
+    local -a flags=()
+    (( confirm ))   && flags+=(-c)
+    [[ -n $ttl ]]   && flags+=(-t "$ttl")
+
+    local n key tmp base_dir kpcli
+    for n in "${names[@]}"; do
+        require_host "$n"
+        key=$(keyfile "$n")
+
+        if [[ -f $key ]]; then
+            ssh-add "${flags[@]}" "$key"
+        elif [[ -n $db ]]; then
+            # Key lives in KeePassXC only. Pull it out, load it, wipe it.
+            # /dev/shm is RAM-backed so it never hits disk — but it's a Linux
+            # thing. macOS has no equivalent, so the copy is briefly on disk
+            # there; we unlink it immediately after ssh-add.
+            kpcli=$(kp_bin)
+            if   [[ -d ${XDG_RUNTIME_DIR:-} ]]; then base_dir=$XDG_RUNTIME_DIR
+            elif [[ -d /dev/shm ]];             then base_dir=/dev/shm
+            else                                     base_dir=${TMPDIR:-/tmp}
+            fi
+            tmp=$(mktemp -d "$base_dir/skm.XXXXXX")
+            chmod 700 "$tmp"
+            "$kpcli" attachment-export "$db" "$KP_GROUP/$n" "${key:t}" "$tmp/$n"
+            chmod 600 "$tmp/$n"
+            ssh-add "${flags[@]}" "$tmp/$n"
+            rm -rf "$tmp"
+        else
+            die "no key on disk for '$n' — pass -d <db.kdbx> to pull it from KeePassXC"
+        fi
+    done
+
+    print
+    info "scope '$label' is live at $sock"
+    SSH_AUTH_SOCK="$sock" ssh-add -l | sed 's/^/    /'
+    print
+    info "devcontainer.json:"
+    cat <<EOF
+
+    "mounts": [
+      "source=$sock,target=/ssh-agent,type=bind"
+    ],
+    "containerEnv": { "SSH_AUTH_SOCK": "/ssh-agent" }
+
+EOF
+    info "inside the container, 'ssh-add -l' should show only the keys above."
+}
+
+cmd_scopes() {
+    [[ -d $SOCK_DIR ]] || die "no scoped agents"
+    local s label
+    for s in $SOCK_DIR/*.sock(N); do
+        label=${s:t:r}
+        if SSH_AUTH_SOCK="$s" ssh-add -l >/dev/null 2>&1; then
+            print -r -- "$label"
+            SSH_AUTH_SOCK="$s" ssh-add -l | sed 's/^/    /'
+        else
+            print -r -- "$label  (dead socket)"
+        fi
+    done
+}
+
+cmd_unscope() {
+    local label=${1:-}
+    [[ -n $label ]] || die "usage: skm unscope <label>"
+    local sock="$SOCK_DIR/$label.sock" pidf="$SOCK_DIR/$label.pid"
+    [[ -S $sock || -f $pidf ]] || die "no such scope: $label"
+
+    # ssh-agent -k kills the agent named by SSH_AGENT_PID, so we need the pid
+    # we recorded at startup — the socket path alone isn't enough.
+    if [[ -f $pidf ]]; then
+        SSH_AGENT_PID="$(<$pidf)" SSH_AUTH_SOCK="$sock" ssh-agent -k >/dev/null 2>&1 || true
+    fi
+    rm -f "$sock" "$pidf"
+    info "killed scope '$label'"
+}
+
+# ---------------------------------------------------------------- dispatch
+
+case "${1:-help}" in
+    add)     shift; cmd_add     "$@" ;;
+    alias)   shift; cmd_alias   "$@" ;;
+    list)    shift; cmd_list    "$@" ;;
+    show)    shift; cmd_show    "$@" ;;
+    copy)    shift; cmd_copy    "$@" ;;
+    rm)      shift; cmd_rm      "$@" ;;
+    export)  shift; cmd_export  "$@" ;;
+    agent)   shift; cmd_agent   "$@" ;;
+    ondisk)  shift; cmd_ondisk  "$@" ;;
+    scope)   shift; cmd_scope   "$@" ;;
+    scopes)  shift; cmd_scopes  "$@" ;;
+    unscope) shift; cmd_unscope "$@" ;;
+    *)       sed -n '3,20p' "$0" | sed 's/^# \?//' ;;
+esac
