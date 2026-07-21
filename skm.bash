@@ -12,6 +12,9 @@
 #   skm rm <name>                       delete key + config entry
 #   skm export [--force] <name|--all> <db.kdbx>
 #                                      import key into KeePassXC as an agent key
+#   skm drop [--force] <name> <db.kdbx> remove local key (fingerprint-verified)
+#   skm restore [--force] <name> <db.kdbx>
+#                                      pull key from KeePassXC back to disk
 #   skm agent <name>                    point IdentityFile at the .pub (agent supplies private)
 #   skm ondisk <name>                   undo `agent`
 #   skm scope <label> [-c] [-t 8h] [-d db.kdbx] <name>...
@@ -202,6 +205,33 @@ kp_entry_exists() {   # db entry pw  ->  0 if the entry is present
     printf '%s\n' "$3" | keepassxc-cli show "$1" "$2" >/dev/null 2>&1
 }
 
+# SHA256 fingerprint only (no comment/bit-count noise), so a match is a real
+# match. Works on a private key without its passphrase.
+key_fingerprint() {   # file -> "SHA256:..."  (prints nothing on failure)
+    ssh-keygen -lf "$1" 2>/dev/null | awk '{print $2}' || true
+}
+
+secure_rm() {   # file -> best-effort secure delete
+    if command -v shred >/dev/null 2>&1; then
+        shred -u "$1" 2>/dev/null || rm -f "$1"
+    elif [[ $(uname) == Darwin ]]; then
+        rm -P "$1"
+    else
+        rm -f "$1"
+    fi
+}
+
+ramtemp() {   # -> path to a fresh 0700 dir, RAM-backed if the platform has one
+    local base
+    if   [[ -d ${XDG_RUNTIME_DIR:-} ]]; then base=$XDG_RUNTIME_DIR
+    elif [[ -d /dev/shm ]];             then base=/dev/shm
+    else                                     base=${TMPDIR:-/tmp}
+    fi
+    local d; d=$(mktemp -d "$base/skm.XXXXXX")
+    chmod 700 "$d"
+    printf '%s\n' "$d"
+}
+
 export_one() {
     local name=$1 db=$2 pw=$3 force=${4:-0}
     local key; key=$(keyfile "$name")
@@ -278,6 +308,112 @@ cmd_export() {
     echo
     info "next: in KeePassXC, enable Tools > Settings > SSH Agent, then re-unlock the database."
     info "verify with 'ssh-add -l', then run 'skm agent <name>' and delete the on-disk key."
+}
+
+# Delete the on-disk private key so it lives only in KeePassXC. Deliberately
+# single-key (no --all): this is meant to require real consideration each time.
+cmd_drop() {
+    command -v keepassxc-cli >/dev/null || die "keepassxc-cli not found"
+
+    local force=0 args=()
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -f|--force|--overwrite) force=1; shift ;;
+            -*)                     die "unknown flag: $1" ;;
+            *)                      args+=("$1"); shift ;;
+        esac
+    done
+    local name=${args[0]:-} db=${args[1]:-}
+    [[ -n $name && -n $db ]] || die "usage: skm drop [--force] <name> <database.kdbx>"
+    require_host "$name"
+    [[ -f $db ]] || die "no such database: $db"
+
+    local key; key=$(keyfile "$name")
+    [[ -f $key ]] || die "no local private key for '$name' (already dropped?)"
+
+    local entry="$KP_GROUP/$name" base; base=$(basename "$key")
+
+    read -rsp "KeePassXC database password: " pw; echo
+
+    local have; have=$(key_fingerprint "$key")
+    [[ -n $have ]] || die "could not read local key: $key"
+
+    local tmpdir; tmpdir=$(ramtemp)
+    local vault_key="$tmpdir/$base" vault_fp=""
+    if printf '%s\n' "$pw" | keepassxc-cli attachment-export "$db" "$entry" "$base" "$vault_key" \
+            2>/dev/null; then
+        vault_fp=$(key_fingerprint "$vault_key")
+    fi
+    rm -rf "$tmpdir"
+
+    echo
+    info "local:  $have"
+    info "vault:  ${vault_fp:-(not found in KeePassXC)}"
+
+    if [[ -n $vault_fp && $vault_fp == "$have" ]]; then
+        info "fingerprints match -- reversible via 'skm restore $name $db'"
+        read -rp "delete local private key for '$name'? [y/N] " ans
+        [[ ${ans,,} == y* ]] || { info "aborted"; return; }
+    else
+        if [[ -z $vault_fp ]]; then
+            info "DANGER: '$name' is not in KeePassXC under $entry -- deleting now loses the only copy"
+        else
+            info "DANGER: fingerprints differ -- the vault copy is NOT this key"
+        fi
+        ((force)) || die "refusing to delete (re-run with --force if you're sure)"
+        read -rp "this cannot be undone -- really delete '$key'? [y/N] " ans
+        [[ ${ans,,} == y* ]] || { info "aborted"; return; }
+    fi
+
+    secure_rm "$key"
+    retarget "$name" agent
+
+    echo
+    info "'$name' now resolves its key via the ssh-agent; verify with 'ssh-add -l'"
+}
+
+# Inverse of drop: pull the private key back out of KeePassXC onto disk, in
+# the layout skm expects, and flip the config back to on-disk.
+cmd_restore() {
+    command -v keepassxc-cli >/dev/null || die "keepassxc-cli not found"
+
+    local force=0 args=()
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -f|--force|--overwrite) force=1; shift ;;
+            -*)                     die "unknown flag: $1" ;;
+            *)                      args+=("$1"); shift ;;
+        esac
+    done
+    local name=${args[0]:-} db=${args[1]:-}
+    [[ -n $name && -n $db ]] || die "usage: skm restore [--force] <name> <database.kdbx>"
+    require_host "$name"
+    [[ -f $db ]] || die "no such database: $db"
+
+    local key; key=$(keyfile "$name")
+    if [[ -f $key ]] && ((! force)); then
+        die "local key already present: $key  (re-run with --force to overwrite)"
+    fi
+
+    local entry="$KP_GROUP/$name" base; base=$(basename "$key")
+
+    read -rsp "KeePassXC database password: " pw; echo
+
+    printf '%s\n' "$pw" | keepassxc-cli attachment-export "$db" "$entry" "$base" "$key" 2>/dev/null \
+        || die "no key attachment for '$name' in $entry"
+    chmod 600 "$key"
+
+    if [[ ! -f $key.pub ]]; then
+        ssh-keygen -y -f "$key" > "$key.pub"
+        chmod 644 "$key.pub"
+    fi
+
+    retarget "$name" ondisk
+
+    echo
+    info "restored $name -> $key"
+    info "fingerprint: $(key_fingerprint "$key")"
+    info "$name now reads $key directly"
 }
 
 # ---------------------------------------------------------------- scoping
@@ -401,6 +537,8 @@ case "${1:-help}" in
     copy)   shift; cmd_copy   "$@" ;;
     rm)     shift; cmd_rm     "$@" ;;
     export) shift; cmd_export "$@" ;;
+    drop)    shift; cmd_drop    "$@" ;;
+    restore) shift; cmd_restore "$@" ;;
     agent)  shift; cmd_agent  "$@" ;;
     ondisk) shift; cmd_ondisk "$@" ;;
     scope)   shift; cmd_scope   "$@" ;;
