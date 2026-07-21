@@ -5,6 +5,8 @@
 # Optionally:      the private key stored in KeePassXC and removed from disk.
 #
 #   skm add <name> <user@host> [port]   generate key + config entry
+#   skm provision <name> <user@host> [port] <db.kdbx>
+#                                      add + export + agent + drop, in one go
 #   skm alias <name> <pattern>...       let more names/IPs/globs use this key
 #   skm list                            show managed hosts
 #   skm show <name>                     print the public key
@@ -110,6 +112,55 @@ EOF
     cat "$key.pub"
     print
     info "install it with:  skm copy $name"
+}
+
+# The ideal end state for a new key: config + public key on disk, private key
+# only in KeePassXC. This chains the four manual steps (add, export, agent,
+# drop) and, since drop's deletion is irreversible if the agent isn't actually
+# serving the key yet, pauses to verify the key is loaded before deleting it.
+cmd_provision() {
+    local usage="usage: skm provision <name> <user@host> [port] <database.kdbx>"
+    local name=${1:-} dest=${2:-} port=22 db=""
+    case $# in
+        3) db=${3:-} ;;
+        4) port=${3:-}; db=${4:-} ;;
+        *) die "$usage" ;;
+    esac
+    [[ -n $name && -n $dest && -n $db ]] || die "$usage"
+    [[ -f $db ]] || die "no such database: $db"
+
+    cmd_add    "$name" "$dest" "$port"
+    cmd_export "$name" "$db"
+    cmd_agent  "$name"
+
+    local key=$(keyfile "$name")
+    local fp=$(key_fingerprint "$key")
+    [[ -n $fp ]] || die "could not read local key: $key"
+
+    print
+    info "before the on-disk private key can be deleted, KeePassXC must be serving it:"
+    info "  1. KeePassXC > Tools > Settings > SSH Agent: enable the agent integration"
+    info "  2. re-unlock (or reopen) $db"
+
+    local ans=""
+    while true; do
+        print
+        read -r "ans?press Enter to check the agent (or type 'skip' to continue anyway): " || ans=""
+        if [[ ${(L)ans} == skip ]]; then
+            info "skipping agent verification"
+            break
+        fi
+        if ssh-add -l 2>/dev/null | grep -qF "$fp"; then
+            info "agent is serving $name ($fp)"
+            break
+        fi
+        info "agent does not list $fp yet -- unlock KeePassXC and try again"
+    done
+
+    cmd_drop "$name" "$db"
+
+    print
+    info "provisioned '$name': config + public key on disk, private key in KeePassXC only"
 }
 
 # `Host` takes a list of patterns, so extra domains / IPs / globs can share a
@@ -625,7 +676,8 @@ cmd_unscope() {
 # ---------------------------------------------------------------- dispatch
 
 case "${1:-help}" in
-    add)     shift; cmd_add     "$@" ;;
+    add)       shift; cmd_add       "$@" ;;
+    provision) shift; cmd_provision "$@" ;;
     alias)   shift; cmd_alias   "$@" ;;
     list)    shift; cmd_list    "$@" ;;
     show)    shift; cmd_show    "$@" ;;
@@ -639,5 +691,5 @@ case "${1:-help}" in
     scope)   shift; cmd_scope   "$@" ;;
     scopes)  shift; cmd_scopes  "$@" ;;
     unscope) shift; cmd_unscope "$@" ;;
-    *)       sed -n '3,20p' "$0" | sed 's/^# \?//' ;;
+    *)       sed -n '3,25p' "$0" | sed 's/^# \?//' ;;
 esac
