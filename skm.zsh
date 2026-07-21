@@ -10,7 +10,8 @@
 #   skm show <name>                     print the public key
 #   skm copy <name>                     ssh-copy-id the key to the server
 #   skm rm <name>                       delete key + config entry
-#   skm export <name|--all> <db.kdbx>   import key into KeePassXC as an agent key
+#   skm export [--force] <name|--all> <db.kdbx>
+#                                      import key into KeePassXC as an agent key
 #   skm agent <name>                    point IdentityFile at the .pub (agent supplies private)
 #   skm ondisk <name>                   undo `agent`
 #   skm scope <label> [-c] [-t 8h] [-d db.kdbx] <name>...
@@ -254,9 +255,14 @@ run_kp() {
     print -r -- "$KP_PW" | "$KP_CLI" "$@" >/dev/null
 }
 
+kp_entry_exists() {   # db entry  ->  0 if the entry is present
+    print -r -- "$KP_PW" | "$KP_CLI" show "$1" "$2" >/dev/null 2>&1
+}
+
 export_one() {
     local name=$1
     local db=$2
+    local force=${3:-0}
     local key=$(keyfile "$name")
     local entry="$KP_GROUP/$name"
     local base=${key:t}
@@ -266,6 +272,13 @@ export_one() {
     run_kp mkdir "$db" "$KP_GROUP" 2>/dev/null || true
     run_kp add   "$db" "$entry" --url "ssh://$name" 2>/dev/null \
         || info "entry '$entry' exists, updating attachments"
+
+    # attachment-import refuses to clobber an attachment that's already there,
+    # so on --force strip the old ones first (no-op if this is a fresh entry).
+    if (( force )); then
+        run_kp attachment-rm "$db" "$entry" "$base"             2>/dev/null || true
+        run_kp attachment-rm "$db" "$entry" "KeeAgent.settings" 2>/dev/null || true
+    fi
 
     local tmp=$(mktemp "${TMPDIR:-/tmp}/skm.XXXXXX")   # BSD mktemp needs a template
     keeagent_xml "$base" > "$tmp"
@@ -278,22 +291,47 @@ export_one() {
 }
 
 cmd_export() {
-    local what=${1:-} db=${2:-}
-    [[ -n $what && -n $db ]] || die "usage: skm export <name|--all> <database.kdbx>"
+    local force=0
+    local n
+    local -a args=()
+    while (( $# > 0 )); do
+        case $1 in
+            -f|--force|--overwrite) force=1;      shift ;;
+            --all)                  args+=("$1"); shift ;;
+            -*)                     die "unknown flag: $1" ;;
+            *)                      args+=("$1"); shift ;;
+        esac
+    done
+    local what=${args[1]:-} db=${args[2]:-}
+    [[ -n $what && -n $db ]] || die "usage: skm export [--force] <name|--all> <database.kdbx>"
     [[ -f $db ]] || die "no such database: $db"
 
     typeset -g KP_CLI=$(kp_bin)
     typeset -g KP_PW=""
+
+    local -a names=()
+    if [[ $what == --all ]]; then
+        local f
+        for f in $CONF_DIR/*.conf(N); do names+=("${f:t:r}"); done
+        (( ${#names} > 0 )) || die "nothing managed to export"
+    else
+        require_host "$what"
+        names=("$what")
+    fi
+
     read -rs "KP_PW?KeePassXC database password: " || die "no password given"
     print   # -s ate the newline
 
-    local f
-    if [[ $what == --all ]]; then
-        for f in $CONF_DIR/*.conf(N); do export_one "${f:t:r}" "$db"; done
-    else
-        require_host "$what"
-        export_one "$what" "$db"
+    if (( ! force )); then
+        local -a existing=()
+        for n in "${names[@]}"; do
+            kp_entry_exists "$db" "$KP_GROUP/$n" && existing+=("$n")
+        done
+        (( ${#existing} == 0 )) || \
+            die "already in KeePassXC: ${existing[*]}  (re-run with --force to overwrite)"
     fi
+
+    for n in "${names[@]}"; do export_one "$n" "$db" "$force"; done
     unset KP_PW
 
     print

@@ -10,7 +10,8 @@
 #   skm show <name>                     print the public key
 #   skm copy <name>                     ssh-copy-id the key to the server
 #   skm rm <name>                       delete key + config entry
-#   skm export <name|--all> <db.kdbx>   import key into KeePassXC as an agent key
+#   skm export [--force] <name|--all> <db.kdbx>
+#                                      import key into KeePassXC as an agent key
 #   skm agent <name>                    point IdentityFile at the .pub (agent supplies private)
 #   skm ondisk <name>                   undo `agent`
 #   skm scope <label> [-c] [-t 8h] [-d db.kdbx] <name>...
@@ -197,8 +198,12 @@ keeagent_xml() {
 EOF
 }
 
+kp_entry_exists() {   # db entry pw  ->  0 if the entry is present
+    printf '%s\n' "$3" | keepassxc-cli show "$1" "$2" >/dev/null 2>&1
+}
+
 export_one() {
-    local name=$1 db=$2 pw=$3
+    local name=$1 db=$2 pw=$3 force=${4:-0}
     local key; key=$(keyfile "$name")
     local entry="$KP_GROUP/$name"
     local base; base=$(basename "$key")
@@ -214,6 +219,13 @@ export_one() {
     run_kp add    "$db" "$entry" --url "ssh://$name" 2>/dev/null || \
         info "entry '$entry' exists, updating attachments"
 
+    # attachment-import refuses to clobber an attachment that's already there,
+    # so on --force strip the old ones first (no-op if this is a fresh entry).
+    if ((force)); then
+        run_kp attachment-rm "$db" "$entry" "$base"             2>/dev/null || true
+        run_kp attachment-rm "$db" "$entry" "KeeAgent.settings" 2>/dev/null || true
+    fi
+
     local tmp; tmp=$(mktemp)
     keeagent_xml "$base" > "$tmp"
 
@@ -226,18 +238,42 @@ export_one() {
 
 cmd_export() {
     command -v keepassxc-cli >/dev/null || die "keepassxc-cli not found"
-    local what=${1:-} db=${2:-}
-    [[ -n $what && -n $db ]] || die "usage: skm export <name|--all> <database.kdbx>"
+
+    local force=0 args=()
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -f|--force|--overwrite) force=1; shift ;;
+            --all)                  args+=("$1"); shift ;;
+            -*)                     die "unknown flag: $1" ;;
+            *)                      args+=("$1"); shift ;;
+        esac
+    done
+    local what=${args[0]:-} db=${args[1]:-}
+    [[ -n $what && -n $db ]] || die "usage: skm export [--force] <name|--all> <database.kdbx>"
     [[ -f $db ]] || die "no such database: $db"
+
+    local names=()
+    if [[ $what == --all ]]; then
+        shopt -s nullglob
+        for f in "$CONF_DIR"/*.conf; do names+=("$(basename "$f" .conf)"); done
+        [[ ${#names[@]} -gt 0 ]] || die "nothing managed to export"
+    else
+        require_host "$what"; names=("$what")
+    fi
 
     read -rsp "KeePassXC database password: " pw; echo
 
-    if [[ $what == --all ]]; then
-        shopt -s nullglob
-        for f in "$CONF_DIR"/*.conf; do export_one "$(basename "$f" .conf)" "$db" "$pw"; done
-    else
-        require_host "$what"; export_one "$what" "$db" "$pw"
+    if ((! force)); then
+        local n existing=()
+        for n in "${names[@]}"; do
+            kp_entry_exists "$db" "$KP_GROUP/$n" "$pw" && existing+=("$n")
+        done
+        [[ ${#existing[@]} -eq 0 ]] || \
+            die "already in KeePassXC: ${existing[*]}  (re-run with --force to overwrite)"
     fi
+
+    local n
+    for n in "${names[@]}"; do export_one "$n" "$db" "$pw" "$force"; done
 
     echo
     info "next: in KeePassXC, enable Tools > Settings > SSH Agent, then re-unlock the database."
