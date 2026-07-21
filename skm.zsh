@@ -296,8 +296,16 @@ export_one() {
     local key=$(keyfile "$name")
     local entry="$KP_GROUP/$name"
     local base=${key:t}
+    local pub=$key.pub
+    local pubtmp=""
 
     [[ -f $key ]] || die "no private key on disk for '$name' (already exported?)"
+
+    if [[ ! -f $pub ]]; then
+        pubtmp=$(mktemp "${TMPDIR:-/tmp}/skm.XXXXXX")
+        ssh-keygen -y -f "$key" > "$pubtmp"
+        pub=$pubtmp
+    fi
 
     run_kp mkdir "$db" "$KP_GROUP" 2>/dev/null || true
     run_kp add   "$db" "$entry" --url "ssh://$name" 2>/dev/null \
@@ -307,6 +315,7 @@ export_one() {
     # so on --force strip the old ones first (no-op if this is a fresh entry).
     if (( force )); then
         run_kp attachment-rm "$db" "$entry" "$base"             2>/dev/null || true
+        run_kp attachment-rm "$db" "$entry" "$base.pub"         2>/dev/null || true
         run_kp attachment-rm "$db" "$entry" "KeeAgent.settings" 2>/dev/null || true
     fi
 
@@ -314,10 +323,11 @@ export_one() {
     keeagent_xml "$base" > "$tmp"
 
     run_kp attachment-import "$db" "$entry" "$base"             "$key"
+    run_kp attachment-import "$db" "$entry" "$base.pub"         "$pub"
     run_kp attachment-import "$db" "$entry" "KeeAgent.settings" "$tmp"
-    rm -f "$tmp"
+    rm -f "$tmp" "$pubtmp"
 
-    info "exported $name -> $entry"
+    info "exported $name -> $entry (private + public key)"
 }
 
 cmd_export() {
@@ -477,7 +487,11 @@ cmd_restore() {
         || die "no key attachment for '$name' in $entry"
     chmod 600 "$key"
 
-    if [[ ! -f $key.pub ]]; then
+    if print -r -- "$pw" | "$kpcli" attachment-export "$db" "$entry" "$base.pub" "$key.pub" \
+            2>/dev/null; then
+        chmod 644 "$key.pub"
+    elif [[ ! -f $key.pub ]]; then
+        info "no public key attachment in $entry; regenerating from the private key"
         ssh-keygen -y -f "$key" > "$key.pub"
         chmod 644 "$key.pub"
     fi

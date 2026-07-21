@@ -237,8 +237,16 @@ export_one() {
     local key; key=$(keyfile "$name")
     local entry="$KP_GROUP/$name"
     local base; base=$(basename "$key")
+    local pubtmp=""
 
     [[ -f $key ]] || die "no private key on disk for '$name' (already exported?)"
+
+    local pub="$key.pub"
+    if [[ ! -f $pub ]]; then
+        pubtmp=$(mktemp)
+        ssh-keygen -y -f "$key" > "$pubtmp"
+        pub=$pubtmp
+    fi
 
     local kp=(keepassxc-cli)
     # keepassxc-cli reads the database password from stdin, so we hand it the
@@ -253,6 +261,7 @@ export_one() {
     # so on --force strip the old ones first (no-op if this is a fresh entry).
     if ((force)); then
         run_kp attachment-rm "$db" "$entry" "$base"             2>/dev/null || true
+        run_kp attachment-rm "$db" "$entry" "$base.pub"         2>/dev/null || true
         run_kp attachment-rm "$db" "$entry" "KeeAgent.settings" 2>/dev/null || true
     fi
 
@@ -260,10 +269,11 @@ export_one() {
     keeagent_xml "$base" > "$tmp"
 
     run_kp attachment-import "$db" "$entry" "$base"            "$key"
+    run_kp attachment-import "$db" "$entry" "$base.pub"        "$pub"
     run_kp attachment-import "$db" "$entry" "KeeAgent.settings" "$tmp"
-    rm -f "$tmp"
+    rm -f "$tmp" "$pubtmp"
 
-    info "exported $name -> $entry"
+    info "exported $name -> $entry (private + public key)"
 }
 
 cmd_export() {
@@ -403,7 +413,11 @@ cmd_restore() {
         || die "no key attachment for '$name' in $entry"
     chmod 600 "$key"
 
-    if [[ ! -f $key.pub ]]; then
+    if printf '%s\n' "$pw" | keepassxc-cli attachment-export "$db" "$entry" "$base.pub" "$key.pub" \
+            2>/dev/null; then
+        chmod 644 "$key.pub"
+    elif [[ ! -f $key.pub ]]; then
+        info "no public key attachment in $entry; regenerating from the private key"
         ssh-keygen -y -f "$key" > "$key.pub"
         chmod 644 "$key.pub"
     fi
