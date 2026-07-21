@@ -9,6 +9,7 @@
 #                                      add + export + agent + drop, in one go
 #   skm alias <name> <pattern>...       let more names/IPs/globs use this key
 #   skm list                            show managed hosts
+#   skm status [name|--all] [db.kdbx]   show where each key's private/public half lives
 #   skm show <name>                     print the public key
 #   skm copy <name>                     ssh-copy-id the key to the server
 #   skm rm <name>                       delete key + config entry
@@ -189,6 +190,162 @@ cmd_list() {
         [[ $id == *.pub ]] && agent="  (agent)"
         printf '%-14s %-28s %s%s\n' "$name" "$target" "$(basename "$id")" "$agent"
     done
+}
+
+# Derive a one-line health verdict from the gathered signals. A fingerprint
+# mismatch trumps everything else -- it means the vault copy silently isn't
+# the key it claims to be.
+status_verdict() {
+    local mode=$1 priv_disk=$2 priv_vault=$3 fp_status=$4 agent_state=$5
+
+    if [[ $fp_status == MISMATCH ]]; then
+        printf 'DANGER: vault copy is a different key from the on-disk copy'
+        return
+    fi
+
+    if [[ $mode == ondisk ]]; then
+        if [[ $priv_disk == yes ]]; then
+            local s="OK (on disk)"
+            case $priv_vault in
+                yes) s+=", vault backup present" ;;
+                no)  s+=", not in vault" ;;
+            esac
+            printf '%s' "$s"
+        else
+            local s="BROKEN: IdentityFile points at the private key, but none is on disk"
+            [[ $priv_vault == yes ]] && s+=" (in vault -- try: skm restore)"
+            printf '%s' "$s"
+        fi
+        return
+    fi
+
+    # agent mode
+    if [[ $priv_disk == yes ]]; then
+        case $priv_vault in
+            yes) printf 'redundant: private key on disk AND in vault (consider: skm drop)' ;;
+            no)  printf 'WARNING: agent mode but private key only on disk, not in vault' ;;
+            *)   printf 'WARNING: agent mode but private key still on disk (pass a db.kdbx to check the vault)' ;;
+        esac
+        return
+    fi
+
+    case $priv_vault in
+        yes)
+            case $agent_state in
+                serving)       printf 'OK (vault-only, agent serving)' ;;
+                'not serving') printf 'OK (vault-only) -- agent NOT serving (unlock KeePassXC)' ;;
+                *)             printf 'OK (vault-only, agent status unknown)' ;;
+            esac
+            ;;
+        no)  printf 'LOST: no private key on disk or in vault' ;;
+        *)   printf 'OK (assumed vault-only; pass a db.kdbx to verify)' ;;
+    esac
+}
+
+status_one() {
+    local name=$1 db=$2 pw=$3
+    local conf; conf=$(conffile "$name")
+    local key; key=$(keyfile "$name")
+    local pub="$key.pub"
+
+    local target
+    target="$(awk '$1=="User"{u=$2} $1=="HostName"{h=$2} $1=="Port"{p=$2} \
+                   END{printf "%s@%s%s", u, h, (p=="22"?"":":" p)}' "$conf")"
+    local id; id=$(awk '$1=="IdentityFile"{print $2}' "$conf")
+    local mode="ondisk"; [[ $id == *.pub ]] && mode="agent"
+
+    local priv_disk="no" pub_disk="no"
+    [[ -f $key ]] && priv_disk="yes"
+    [[ -f $pub ]] && pub_disk="yes"
+
+    local local_fp=""
+    [[ $priv_disk == yes ]] && local_fp=$(key_fingerprint "$key")
+
+    local priv_vault="?" pub_vault="?" vault_fp="" fp_status="n/a (no db)"
+    if [[ -n $db ]]; then
+        local entry="$KP_GROUP/$name" base; base=$(basename "$key")
+        local tmpdir; tmpdir=$(ramtemp)
+        if printf '%s\n' "$pw" | keepassxc-cli attachment-export "$db" "$entry" "$base" \
+                "$tmpdir/$base" 2>/dev/null; then
+            priv_vault="yes"
+            vault_fp=$(key_fingerprint "$tmpdir/$base")
+        else
+            priv_vault="no"
+        fi
+        if printf '%s\n' "$pw" | keepassxc-cli attachment-export "$db" "$entry" "$base.pub" \
+                "$tmpdir/$base.pub" 2>/dev/null; then
+            pub_vault="yes"
+        else
+            pub_vault="no"
+        fi
+        rm -rf "$tmpdir"
+
+        if [[ -n $local_fp && -n $vault_fp ]]; then
+            [[ $local_fp == "$vault_fp" ]] && fp_status="match" || fp_status="MISMATCH"
+        elif [[ -n $local_fp || -n $vault_fp ]]; then
+            fp_status="n/a (only one copy present)"
+        else
+            fp_status="n/a"
+        fi
+    fi
+
+    local fp_for_agent=$local_fp
+    [[ -z $fp_for_agent ]] && fp_for_agent=$vault_fp
+    local agent_state="unknown"
+    if [[ -n $fp_for_agent ]]; then
+        if ssh-add -l 2>/dev/null | grep -qF "$fp_for_agent"; then
+            agent_state="serving"
+        else
+            agent_state="not serving"
+        fi
+    fi
+
+    local verdict
+    verdict=$(status_verdict "$mode" "$priv_disk" "$priv_vault" "$fp_status" "$agent_state")
+
+    echo "$name"
+    printf '  %-13s %s\n' "target" "$target"
+    printf '  %-13s %s%s\n' "IdentityFile" "$(basename "$id")" "$([[ $mode == agent ]] && printf '   (agent)')"
+    printf '  %-13s disk: %-4s vault: %s\n' "private" "$priv_disk" "$priv_vault"
+    printf '  %-13s disk: %-4s vault: %s\n' "public"  "$pub_disk"  "$pub_vault"
+    [[ -n $db ]] && printf '  %-13s %s\n' "fingerprint" "$fp_status"
+    printf '  %-13s %s\n' "agent"  "$agent_state"
+    printf '  %-13s %s\n' "status" "$verdict"
+    echo
+}
+
+cmd_status() {
+    local a args=() db=""
+    for a in "$@"; do
+        if [[ $a == *.kdbx ]]; then
+            db=$a
+        else
+            args+=("$a")
+        fi
+    done
+    [[ -z $db || -f $db ]] || die "no such database: $db"
+
+    local what=${args[0]:-}
+    local names=()
+    if [[ -z $what || $what == --all ]]; then
+        [[ -d $CONF_DIR ]] || die "nothing managed yet"
+        shopt -s nullglob
+        local f
+        for f in "$CONF_DIR"/*.conf; do names+=("$(basename "$f" .conf)"); done
+        [[ ${#names[@]} -gt 0 ]] || die "nothing managed yet"
+    else
+        require_host "$what"
+        names=("$what")
+    fi
+
+    local pw=""
+    if [[ -n $db ]]; then
+        command -v keepassxc-cli >/dev/null || die "keepassxc-cli not found"
+        read -rsp "KeePassXC database password: " pw; echo
+    fi
+
+    local n
+    for n in "${names[@]}"; do status_one "$n" "$db" "$pw"; done
 }
 
 cmd_show() { require_host "$1"; cat "$(keyfile "$1").pub"; }
@@ -599,6 +756,7 @@ case "${1:-help}" in
     provision) shift; cmd_provision "$@" ;;
     alias)  shift; cmd_alias  "$@" ;;
     list)   shift; cmd_list   "$@" ;;
+    status) shift; cmd_status "$@" ;;
     show)   shift; cmd_show   "$@" ;;
     copy)   shift; cmd_copy   "$@" ;;
     rm)     shift; cmd_rm     "$@" ;;
@@ -610,5 +768,5 @@ case "${1:-help}" in
     scope)   shift; cmd_scope   "$@" ;;
     scopes)  shift; cmd_scopes  "$@" ;;
     unscope) shift; cmd_unscope "$@" ;;
-    *)      sed -n '3,25p' "$0" | sed 's/^# \?//' ;;
+    *)      sed -n '3,26p' "$0" | sed 's/^# \?//' ;;
 esac
