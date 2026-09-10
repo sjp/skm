@@ -44,6 +44,7 @@ KP_GROUP="${SKM_KEEPASS_GROUP:-SSH Keys}"
 umask 077
 
 die()  { printf 'skm: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'skm: %s\n' "$*" >&2; }
 info() { printf '  %s\n' "$*"; }
 
 # ---------------------------------------------------------------- bootstrap
@@ -60,31 +61,87 @@ include_arg() {
     fi
 }
 
-# Whether $CONFIG already pulls in the fragment directory, written as the bare
-# relative glob, as '~/.ssh/...', or as a full path, quoted or not.
-include_present() {
-    local rel="" tilde=""
+# Every spelling of the fragment glob that reaches the managed directory. ssh
+# resolves a relative Include against ~/.ssh, so the short forms only mean that
+# directory when it is where skm keeps its files. A glob without the .conf
+# suffix picks the fragments up as well, so it counts as already there.
+include_spellings() {
+    printf '%s/*.conf\n' "$CONF_DIR"
+    printf '%s/*\n'      "$CONF_DIR"
     if [[ $SSH_DIR == "$HOME/.ssh" ]]; then
-        rel='config.d/*.conf'
-        # A literal string to compare against, not a path to resolve: this is
+        # Literal strings to compare against, not paths to resolve: this is
         # simply how a hand-written ssh config usually spells the same glob.
         # shellcheck disable=SC2088
-        tilde='~/.ssh/config.d/*.conf'
+        printf '%s\n' 'config.d/*.conf' 'config.d/*' \
+                      '~/.ssh/config.d/*.conf' '~/.ssh/config.d/*'
     fi
-    awk -v abs="$CONF_DIR/*.conf" -v rel="$rel" -v tilde="$tilde" '
+}
+
+# Where $CONFIG stands on including the fragment directory: a kind, the line the
+# Include sits on, and the line and text of the first Host or Match ahead of it.
+#
+#     absent 0 0
+#     top 1 0
+#     shadowed 12 3 Host *
+#
+# The position is worth knowing because ssh keeps the first value it sees for
+# each setting: an Include below a catch-all block still reads the fragments,
+# but nothing in them can override what that block has already set.
+include_state() {
+    [[ -f $CONFIG ]] || { printf 'absent 0 0\n'; return; }
+    awk -v spellings="$(include_spellings)" '
+        BEGIN {
+            n = split(spellings, s, "\n")
+            for (i = 1; i <= n; i++) want[s[i]] = 1
+        }
+        # The argument of Include is a list, and any member of it may be quoted.
+        function names_dir(args,   tok, i) {
+            while (args != "") {
+                sub(/^[ \t]+/, "", args)
+                if (args == "") break
+                if (substr(args, 1, 1) == "\"") {
+                    args = substr(args, 2)
+                    i = index(args, "\"")
+                    tok  = (i ? substr(args, 1, i - 1) : args)
+                    args = (i ? substr(args, i + 1)    : "")
+                } else {
+                    i = match(args, /[ \t]/)
+                    tok  = (i ? substr(args, 1, i - 1) : args)
+                    args = (i ? substr(args, i)        : "")
+                }
+                if (tok in want) return 1
+            }
+            return 0
+        }
         {
             line = $0
             sub(/^[ \t]+/, "", line)
-            if (line !~ /^Include[ \t]/) next
-            sub(/^Include[ \t]+/, "", line)
             sub(/[ \t]+$/, "", line)
-            if (line ~ /^".*"$/) line = substr(line, 2, length(line) - 2)
-            if (line == abs || (rel != "" && (line == rel || line == tilde))) {
-                found = 1
-                exit
+            if (line == "" || line ~ /^#/) next
+
+            # Keywords are case-insensitive and may be joined to their argument
+            # by an equals sign rather than by whitespace.
+            key = line
+            sub(/[ \t=].*$/, "", key)
+            key = tolower(key)
+
+            if (key == "host" || key == "match") {
+                if (!blocker) { blocker = NR; blocker_line = line }
+                next
             }
+            if (key != "include") next
+
+            args = line
+            sub(/^[^ \t=]+[ \t=]*/, "", args)
+            if (!names_dir(args)) next
+            found = NR
+            exit
         }
-        END { exit found ? 0 : 1 }
+        END {
+            if (!found)         print "absent 0 0"
+            else if (blocker)   printf "shadowed %d %d %s\n", found, blocker, blocker_line
+            else                printf "top %d 0\n", found
+        }
     ' "$CONFIG"
 }
 
@@ -93,15 +150,21 @@ ensure_include() {
     chmod 700 "$SSH_DIR" "$CONF_DIR"
     [[ -f $CONFIG ]] || { : > "$CONFIG"; chmod 600 "$CONFIG"; }
 
-    # Include must sit at the very top: ssh_config is first-match-wins, so a
-    # later Include would be shadowed by any earlier catch-all Host block.
-    if ! include_present; then
+    local kind inc blk text
+    read -r kind inc blk text <<< "$(include_state)"
+
+    if [[ $kind == absent ]]; then
+        # The new line goes at the very top so the fragments are read before any
+        # block that might already have set the same options.
         local arg; arg=$(include_arg)
         printf 'Include %s\n\n' "$arg" > "$CONFIG.tmp"
         cat "$CONFIG" >> "$CONFIG.tmp"
         mv "$CONFIG.tmp" "$CONFIG"
         chmod 600 "$CONFIG"
         info "added 'Include $arg' to $CONFIG"
+    elif [[ $kind == shadowed ]]; then
+        warn "$CONFIG pulls in $CONF_DIR on line $inc, below '$text' on line $blk"
+        warn "ssh keeps the first value it sees for each setting, so what skm writes there may be ignored; move the Include line to the top of the file"
     fi
 }
 
@@ -368,6 +431,25 @@ status_verdict() {
     esac
 }
 
+# Whether the fragments skm writes are reachable at all, and whether anything
+# ahead of them in $CONFIG has already had its say. Printed once per run, since
+# it describes the file rather than any one host.
+include_report() {
+    local kind inc blk text
+    read -r kind inc blk text <<< "$(include_state)"
+
+    local note=""
+    case $kind in
+        absent)   note="missing - nothing in $CONF_DIR is read" ;;
+        top)      note="line $inc, ahead of any Host or Match block" ;;
+        shadowed) note="line $inc, below '$text' on line $blk - settings in $CONF_DIR may be ignored" ;;
+    esac
+
+    printf '%s\n' "$CONFIG"
+    printf '  %-13s %s\n' "Include" "$note"
+    echo
+}
+
 status_one() {
     local name=$1 db=$2 pw=$3 kpcli=$4
     local conf; conf=$(conffile "$name")
@@ -463,6 +545,8 @@ cmd_status() {
         require_host "$what"
         names=("$what")
     fi
+
+    include_report
 
     local pw="" kpcli=""
     if [[ -n $db ]]; then

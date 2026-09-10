@@ -142,6 +142,86 @@ teardown() { skm_teardown; }
     assert_equal "$output" 1
 }
 
+@test "an Include already written another way is not repeated" {
+    local spelling
+    for spelling in 'Include config.d/*' \
+                    'Include ~/.ssh/config.d/*.conf' \
+                    'Include ~/.ssh/config.d/*' \
+                    "Include \"$SSH_DIR/config.d/*.conf\"" \
+                    "include $SSH_DIR/config.d/*" \
+                    '  Include	config.d/*.conf'
+    do
+        printf '%s\n' "$spelling" > "$SSH_DIR/config"
+        add_host box
+        run grep -c -i Include "$SSH_DIR/config"
+        assert_equal "$output" 1
+        run head -1 "$SSH_DIR/config"
+        assert_equal "$output" "$spelling"
+        rm -f "$(keyfile box)" "$(keyfile box).pub" "$(conffile box)"
+    done
+}
+
+@test "an Include that only mentions a commented path is not counted" {
+    printf '# Include config.d/*.conf
+Include other.d/*.conf
+' > "$SSH_DIR/config"
+    add_host box
+
+    run head -1 "$SSH_DIR/config"
+    assert_output_has "Include config.d/*.conf"
+    run grep -c Include "$SSH_DIR/config"
+    assert_equal "$output" 3
+}
+
+@test "an Include below a Host block is reported and the file left alone" {
+    printf 'Host *\n    ServerAliveInterval 60\n\nInclude config.d/*.conf\n' \
+        > "$SSH_DIR/config"
+    run skm add box user@example.com
+    assert_ok
+    assert_output_has "below 'Host *' on line 1"
+    assert_output_has "move the Include line to the top"
+
+    # The warning is advice, not an edit: the user keeps their own file.
+    run head -1 "$SSH_DIR/config"
+    assert_equal "$output" "Host *"
+    run grep -c Include "$SSH_DIR/config"
+    assert_equal "$output" 1
+}
+
+@test "an Include above every Host block draws no complaint" {
+    printf 'Include config.d/*.conf\n\nHost *\n    ServerAliveInterval 60\n' \
+        > "$SSH_DIR/config"
+    run skm add box user@example.com
+    assert_ok
+    assert_output_lacks "may be ignored"
+    assert_output_lacks "move the Include line"
+}
+
+@test "status says where the Include sits" {
+    add_host box
+
+    run skm status box
+    assert_ok
+    assert_output_has "$SSH_DIR/config"
+    assert_output_has "ahead of any Host or Match block"
+
+    printf 'Match all\n    ForwardAgent no\n\nInclude config.d/*.conf\n' \
+        > "$SSH_DIR/config"
+    run skm status box
+    assert_ok
+    assert_output_has "below 'Match all' on line 1"
+    assert_output_has "may be ignored"
+}
+
+@test "status says so when nothing includes the fragments" {
+    add_host box
+    printf 'Host *\n    ServerAliveInterval 60\n' > "$SSH_DIR/config"
+
+    run skm status box
+    assert_ok
+    assert_output_has "missing - nothing in $SSH_DIR/config.d is read"
+}
+
 @test "a managed directory outside ~/.ssh is included by its full path" {
     export SSH_DIR="$SKM_TMP/elsewhere"
     mkdir -p "$SSH_DIR"
