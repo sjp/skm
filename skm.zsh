@@ -73,8 +73,14 @@ ensure_include() {
 keyfile()  { print -r -- "$SSH_DIR/id_ed25519_$1" }
 conffile() { print -r -- "$CONF_DIR/$1.conf" }
 
+# Every command that takes a host name goes through here. The second argument
+# is the caller's own usage line: a name that is empty means the argument was
+# left off the command line, and a usage reminder is more use than a complaint
+# about a host called "".
 require_host() {
-    [[ -f $(conffile "$1") ]] || die "no such managed host: $1  (try: skm list)"
+    local name=${1:-} usage=${2:-"usage: skm <command> <name>"}
+    [[ -n $name ]] || die "$usage"
+    [[ -f $(conffile "$name") ]] || die "no such managed host: $name  (try: skm list)"
 }
 
 # ---------------------------------------------------------------- commands
@@ -371,17 +377,21 @@ cmd_status() {
     for n in "${names[@]}"; do status_one "$n" "$db" "$pw" "$kpcli"; done
 }
 
-cmd_show() { require_host "$1"; cat "$(keyfile "$1").pub" }
+cmd_show() {
+    local name=${1:-}
+    require_host "$name" "usage: skm show <name>"
+    cat "$(keyfile "$name").pub"
+}
 
 cmd_copy() {
-    require_host "$1"
-    ssh-copy-id -i "$(keyfile "$1").pub" "$1"
+    local name=${1:-}
+    require_host "$name" "usage: skm copy <name>"
+    ssh-copy-id -i "$(keyfile "$name").pub" "$name"
 }
 
 cmd_rm() {
     local name=${1:-}
-    [[ -n $name ]] || die "usage: skm rm <name>"
-    require_host "$name"
+    require_host "$name" "usage: skm rm <name>"
 
     # zsh's read takes the prompt as name?prompt. Do NOT use bash's `read -rp`:
     # in zsh, -p means "read from the coprocess" and silently reads nothing.
@@ -413,20 +423,22 @@ retarget() {
 }
 
 cmd_agent() {
-    require_host "$1"
-    retarget "$1" agent
-    info "$1 now resolves its key via the ssh-agent"
+    local name=${1:-}
+    require_host "$name" "usage: skm agent <name>"
+    retarget "$name" agent
+    info "$name now resolves its key via the ssh-agent"
     if (( $+commands[shred] )); then            # zsh: $+commands[x] tests PATH
-        info "once verified: shred -u $(keyfile "$1")"
+        info "once verified: shred -u $(keyfile "$name")"
     else
-        info "once verified: rm -P $(keyfile "$1")"    # BSD/macOS
+        info "once verified: rm -P $(keyfile "$name")"    # BSD/macOS
     fi
 }
 
 cmd_ondisk() {
-    require_host "$1"
-    retarget "$1" ondisk
-    info "$1 now reads $(keyfile "$1") directly"
+    local name=${1:-}
+    require_host "$name" "usage: skm ondisk <name>"
+    retarget "$name" ondisk
+    info "$name now reads $(keyfile "$name") directly"
 }
 
 # ---------------------------------------------------------------- keepassxc
@@ -836,6 +848,12 @@ cmd_unscope() {
 
 # ---------------------------------------------------------------- dispatch
 
+# The command summary at the top of this file is the help text; printing it
+# from there keeps the two from drifting apart. $0 inside a zsh function is the
+# function's own name, so the script's path has to be captured out here.
+SKM_SELF=$0
+usage() { sed -n '3,26p' "$SKM_SELF" | sed 's/^# \?//' }
+
 case "${1:-help}" in
     add)       shift; cmd_add       "$@" ;;
     provision) shift; cmd_provision "$@" ;;
@@ -853,5 +871,8 @@ case "${1:-help}" in
     scope)   shift; cmd_scope   "$@" ;;
     scopes)  shift; cmd_scopes  "$@" ;;
     unscope) shift; cmd_unscope "$@" ;;
-    *)       sed -n '3,26p' "$0" | sed 's/^# \?//' ;;
+    help|-h|--help) usage ;;
+    # A mistyped command must not look like a successful run: scripts that
+    # check the exit status would otherwise sail past it.
+    *)       print -u2 "skm: unknown command '$1'"; usage >&2; exit 2 ;;
 esac

@@ -64,8 +64,14 @@ ensure_include() {
 keyfile()  { printf '%s/id_ed25519_%s' "$SSH_DIR" "$1"; }
 conffile() { printf '%s/%s.conf' "$CONF_DIR" "$1"; }
 
+# Every command that takes a host name goes through here. The second argument
+# is the caller's own usage line: a name that is empty means the argument was
+# left off the command line, and a usage reminder is more use than a complaint
+# about a host called "".
 require_host() {
-    [[ -f $(conffile "$1") ]] || die "no such managed host: $1  (try: skm list)"
+    local name=${1:-} usage=${2:-"usage: skm <command> <name>"}
+    [[ -n $name ]] || die "$usage"
+    [[ -f $(conffile "$name") ]] || die "no such managed host: $name  (try: skm list)"
 }
 
 # ---------------------------------------------------------------- commands
@@ -357,15 +363,21 @@ cmd_status() {
     for n in "${names[@]}"; do status_one "$n" "$db" "$pw" "$kpcli"; done
 }
 
-cmd_show() { require_host "$1"; cat "$(keyfile "$1").pub"; }
+cmd_show() {
+    local name=${1:-}
+    require_host "$name" "usage: skm show <name>"
+    cat "$(keyfile "$name").pub"
+}
 
 cmd_copy() {
-    require_host "$1"
-    ssh-copy-id -i "$(keyfile "$1").pub" "$1"
+    local name=${1:-}
+    require_host "$name" "usage: skm copy <name>"
+    ssh-copy-id -i "$(keyfile "$name").pub" "$name"
 }
 
 cmd_rm() {
-    local name=${1:-}; require_host "$name"
+    local name=${1:-}
+    require_host "$name" "usage: skm rm <name>"
 
     # The `||` matters: at EOF (piped or non-interactive input) read returns
     # non-zero, which under `set -e` would otherwise kill the script mid-way
@@ -390,12 +402,20 @@ retarget() {
     rm -f "$conf.bak"
 }
 
-cmd_agent()  { require_host "$1"; retarget "$1" agent
-               info "$1 now resolves its key via the ssh-agent"
-               info "once verified, you can: shred -u $(keyfile "$1")"; }
+cmd_agent() {
+    local name=${1:-}
+    require_host "$name" "usage: skm agent <name>"
+    retarget "$name" agent
+    info "$name now resolves its key via the ssh-agent"
+    info "once verified, you can: shred -u $(keyfile "$name")"
+}
 
-cmd_ondisk() { require_host "$1"; retarget "$1" ondisk
-               info "$1 now reads $(keyfile "$1") directly"; }
+cmd_ondisk() {
+    local name=${1:-}
+    require_host "$name" "usage: skm ondisk <name>"
+    retarget "$name" ondisk
+    info "$name now reads $(keyfile "$name") directly"
+}
 
 # ---------------------------------------------------------------- keepassxc
 
@@ -786,6 +806,10 @@ cmd_unscope() {
 
 # ---------------------------------------------------------------- dispatch
 
+# The command summary at the top of this file is the help text; printing it
+# from there keeps the two from drifting apart.
+usage() { sed -n '3,26p' "$0" | sed 's/^# \?//'; }
+
 case "${1:-help}" in
     add)       shift; cmd_add       "$@" ;;
     provision) shift; cmd_provision "$@" ;;
@@ -803,5 +827,8 @@ case "${1:-help}" in
     scope)   shift; cmd_scope   "$@" ;;
     scopes)  shift; cmd_scopes  "$@" ;;
     unscope) shift; cmd_unscope "$@" ;;
-    *)      sed -n '3,26p' "$0" | sed 's/^# \?//' ;;
+    help|-h|--help) usage ;;
+    # A mistyped command must not look like a successful run: scripts that
+    # check the exit status would otherwise sail past it.
+    *)      printf "skm: unknown command '%s'\n" "$1" >&2; usage >&2; exit 2 ;;
 esac

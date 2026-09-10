@@ -291,9 +291,27 @@ teardown() { skm_teardown; }
     assert_output_has "skm scope <label>"
 }
 
-@test "an unrecognised command prints the command summary" {
+@test "an unrecognised command names it, prints the summary and fails" {
     run skm frobnicate
+    assert_fails
+    assert_equal "$status" 2
+    assert_output_has "unknown command 'frobnicate'"
     assert_output_has "skm add <name>"
+}
+
+@test "an unrecognised command keeps the summary off stdout" {
+    run bash -c '"$1" "$2" frobnicate 2>/dev/null' _ "$SKM_SHELL" "$SKM_SCRIPT"
+    assert_fails
+    assert_equal "$output" ""
+}
+
+@test "asking for help succeeds" {
+    local flag
+    for flag in help -h --help; do
+        run skm "$flag"
+        assert_ok
+        assert_output_has "skm add <name>"
+    done
 }
 
 @test "commands that need a managed host say so instead of crashing" {
@@ -302,5 +320,16 @@ teardown() { skm_teardown; }
         run skm "$cmd" nosuch
         assert_fails
         assert_output_has "no such managed host"
+    done
+}
+
+@test "commands used without a name print their own usage line" {
+    local cmd
+    for cmd in show copy agent ondisk rm; do
+        run skm "$cmd"
+        assert_fails
+        assert_output_has "usage: skm $cmd <name>"
+        assert_output_lacks "unbound variable"
+        assert_output_lacks "parameter not set"
     done
 }
