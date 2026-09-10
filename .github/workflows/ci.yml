@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bats shellcheck keepassxc zsh
+
+      # The cask puts keepassxc-cli inside the app bundle rather than on PATH,
+      # which is exactly the layout the macOS lookup in skm has to cope with.
+      - name: Install tools
+        if: runner.os == 'macOS'
+        run: |
+          brew install bats-core shellcheck
+          brew install --cask keepassxc
+
+      - name: Lint and test
+        run: test/run.sh

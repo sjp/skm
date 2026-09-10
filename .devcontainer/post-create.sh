@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Tooling the checks need: keepassxc supplies keepassxc-cli, which runs
+# headless and needs no display; bats runs the test suites; shellcheck lints
+# the bash port; zsh runs the zsh one.
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    bats keepassxc shellcheck zsh
+
 claude_dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 claude_json=${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json
 
