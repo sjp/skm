@@ -114,6 +114,19 @@ agent_fingerprints() {
     assert_output_has "unknown flag"
 }
 
+@test "scope refuses a label that would not stay inside the agents directory" {
+    add_host box
+    for bad in '../escape' 'a/b' 'my label'; do
+        run skm scope "$bad" box
+        assert_fails
+        assert_output_has "invalid scope label"
+
+        run skm unscope "$bad"
+        assert_fails
+        assert_output_has "invalid scope label"
+    done
+}
+
 @test "unscope needs a scope that exists" {
     run skm unscope nosuch
     assert_fails

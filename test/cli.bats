@@ -23,7 +23,7 @@ teardown() { skm_teardown; }
     assert_output_has "HostName example.com"
     assert_output_has "User user"
     assert_output_has "Port 2222"
-    assert_output_has "IdentityFile $(keyfile box)"
+    assert_output_has "IdentityFile \"$(keyfile box)\""
     assert_output_has "IdentitiesOnly yes"
 
     run head -1 "$SSH_DIR/config"
@@ -71,6 +71,47 @@ teardown() { skm_teardown; }
     run skm add box other@example.org
     assert_fails
     assert_output_has "already exists"
+}
+
+@test "add refuses a name that would not survive a file path or a Host line" {
+    for bad in 'my box' '../x' 'a/b' '.hidden' 'a&b' 'x;y'; do
+        run skm add "$bad" user@example.com
+        assert_fails
+        assert_output_has "invalid host name"
+    done
+    run ls "$SSH_DIR"
+    assert_output_lacks "id_ed25519_"
+}
+
+@test "add accepts letters, digits, dots, underscores and hyphens" {
+    run skm add web-1.eu_2 user@example.com
+    assert_ok
+    assert_file "$(keyfile web-1.eu_2)"
+    assert_equal "$(host_line web-1.eu_2)" 'web-1.eu_2'
+}
+
+@test "add refuses a port that is not a number in range" {
+    for bad in 'notaport' '22; echo pwned' 0 65536 -1 '2 2'; do
+        run skm add box user@example.com "$bad"
+        assert_fails
+        assert_output_has "invalid port"
+    done
+    assert_no_file "$(conffile box)"
+}
+
+@test "add quotes the IdentityFile path so a directory with a space still works" {
+    export SSH_DIR="$SKM_TMP/my dir/.ssh"
+    mkdir -p "$SSH_DIR"
+    add_host box
+
+    run cat "$(conffile box)"
+    assert_output_has "IdentityFile \"$(keyfile box)\""
+
+    # ssh -G reads the fragment the way ssh itself will: the path must come
+    # back whole, not truncated at the space.
+    run ssh -F "$(conffile box)" -G box
+    assert_ok
+    assert_output_has "identityfile $(keyfile box)"
 }
 
 @test "add without arguments explains itself instead of writing anything" {
@@ -138,6 +179,30 @@ teardown() { skm_teardown; }
     run skm alias nosuch example.org
     assert_fails
     assert_output_has "no such managed host"
+}
+
+@test "alias refuses a pattern outside ssh's pattern alphabet" {
+    add_host box
+    for bad in 'a&b' 'c|d' 'x y' 'a\\b' 'a#b' '$(id)'; do
+        run skm alias box "$bad"
+        assert_fails
+        assert_output_has "invalid host pattern"
+        assert_equal "$(host_line box)" 'box'
+    done
+}
+
+@test "alias rejects the whole call if any pattern is invalid" {
+    add_host box
+    run skm alias box good.example.com 'bad&pattern'
+    assert_fails
+    assert_equal "$(host_line box)" 'box'
+}
+
+@test "alias accepts globs and a negated pattern" {
+    add_host box
+    run skm alias box '*.example.com' '10.0.0.?' '!bad-host'
+    assert_ok
+    assert_equal "$(host_line box)" 'box *.example.com 10.0.0.? !bad-host'
 }
 
 @test "alias leaves no editor backup file behind" {
@@ -211,6 +276,13 @@ teardown() { skm_teardown; }
     assert_output_has "Port 2222"
     assert_output_has "ControlPersist 10m"
     assert_no_file "$(conffile box).bak"
+}
+
+@test "agent keeps the indentation of the IdentityFile line" {
+    add_host box
+    skm agent box >/dev/null
+    run grep -c '^    IdentityFile' "$(conffile box)"
+    assert_equal "$output" 1
 }
 
 # --------------------------------------------------------------- status

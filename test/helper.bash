@@ -85,7 +85,12 @@ add_host() { skm add "$1" "${2:-user@example.com}" ${3:+"$3"} >/dev/null 2>&1; }
 
 fingerprint() { ssh-keygen -lf "$1" 2>/dev/null | awk '{print $2}'; }
 
-identity_file() { awk '$1=="IdentityFile"{print $2}' "$(conffile "$1")"; }
+# The config quotes the IdentityFile path, so that a key under a directory with
+# a space in its name is still one argument to ssh.
+identity_file() {
+    awk '$1=="IdentityFile"{ sub(/^[ \t]*IdentityFile[ \t]+/,""); gsub(/^"|"$/,""); print; exit }' \
+        "$(conffile "$1")"
+}
 
 host_line() { awk '$1=="Host"{sub(/^[ \t]*Host[ \t]+/,""); print; exit}' "$(conffile "$1")"; }
 

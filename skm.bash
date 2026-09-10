@@ -64,6 +64,68 @@ ensure_include() {
 keyfile()  { printf '%s/id_ed25519_%s' "$SSH_DIR" "$1"; }
 conffile() { printf '%s/%s.conf' "$CONF_DIR" "$1"; }
 
+# A host name becomes part of a file name, an ssh `Host` pattern, a KeePassXC
+# entry name and an XML attachment name, so it is restricted to characters that
+# mean the same thing in all four: it must start with a letter or digit and hold
+# only letters, digits, '.', '_' and '-'. Excluding '/' and a leading '.' also
+# keeps every derived path inside $SSH_DIR.
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+
+# What ssh itself accepts in a `Host` pattern: host-name characters plus the
+# globs '*' and '?' and the leading '!' that negates a pattern. Whitespace is
+# excluded because the `Host` line is a list — a pattern containing a space
+# would silently become two patterns.
+PATTERN_RE='^[A-Za-z0-9._*?!-]+$'
+
+require_name() {
+    local name=${1:-} what=${2:-host name}
+    [[ $name =~ $NAME_RE ]] || die \
+        "invalid $what: '$name'  (letters, digits, '.', '_' and '-', starting with a letter or digit)"
+}
+
+require_pattern() {
+    local pattern=${1:-}
+    [[ $pattern =~ $PATTERN_RE ]] || die \
+        "invalid host pattern: '$pattern'  (letters, digits, '.', '_', '-' and the globs '*', '?', '!')"
+}
+
+require_port() {
+    local port=${1:-}
+    { [[ $port =~ ^[1-9][0-9]*$ ]] && (( port <= 65535 )); } || die \
+        "invalid port: '$port'  (a number from 1 to 65535)"
+}
+
+# Replace the first line of a config fragment whose first word is $2, keeping
+# that line's indentation. The replacement travels through the environment
+# rather than awk's -v, because -v expands backslash escapes in the value and
+# would mangle any path or pattern containing one.
+replace_conf_line() {
+    local conf=$1 keyword=$2 text=$3
+    SKM_KEYWORD=$keyword SKM_TEXT=$text awk '
+        !replaced && $1 == ENVIRON["SKM_KEYWORD"] {
+            match($0, /^[ \t]*/)
+            print substr($0, 1, RLENGTH) ENVIRON["SKM_TEXT"]
+            replaced = 1
+            next
+        }
+        { print }
+    ' "$conf" > "$conf.new"
+    mv "$conf.new" "$conf"
+    chmod 600 "$conf"
+}
+
+# ssh reads the IdentityFile path as a single quoted argument, so that a key
+# under a directory whose name contains a space still resolves; strip the
+# quotes back off when reading the path out again.
+identity_of() {
+    awk '$1 == "IdentityFile" {
+             sub(/^[ \t]*IdentityFile[ \t]+/, "")
+             gsub(/^"|"$/, "")
+             print
+             exit
+         }' "$1"
+}
+
 # Every command that takes a host name goes through here. The second argument
 # is the caller's own usage line: a name that is empty means the argument was
 # left off the command line, and a usage reminder is more use than a complaint
@@ -71,6 +133,7 @@ conffile() { printf '%s/%s.conf' "$CONF_DIR" "$1"; }
 require_host() {
     local name=${1:-} usage=${2:-"usage: skm <command> <name>"}
     [[ -n $name ]] || die "$usage"
+    require_name "$name"
     [[ -f $(conffile "$name") ]] || die "no such managed host: $name  (try: skm list)"
 }
 
@@ -80,6 +143,8 @@ cmd_add() {
     local name=${1:-} dest=${2:-} port=${3:-22}
     [[ -n $name && -n $dest ]] || die "usage: skm add <name> <user@host> [port]"
     [[ $dest == *@* ]]         || die "destination must be user@host, e.g. git@github.com"
+    require_name "$name"
+    require_port "$port"
 
     local user=${dest%@*} host=${dest#*@}
     local key; key=$(keyfile "$name")
@@ -98,7 +163,7 @@ Host $name
     HostName $host
     User $user
     Port $port
-    IdentityFile $key
+    IdentityFile "$key"
     IdentitiesOnly yes
     # Reuse one authenticated connection for 10 minutes. Repeat 'ssh $name'
     # calls ride the existing master and never re-ask the agent — so a locked
@@ -181,12 +246,12 @@ cmd_alias() {
 
     local p add=()
     for p in "$@"; do
+        require_pattern "$p"
         [[ " $existing " == *" $p "* ]] || add+=("$p")
     done
     [[ ${#add[@]} -gt 0 ]] || { info "already matched by: Host $existing"; return; }
 
-    sed -i.bak "s|^\([ 	]*Host[ 	]\{1,\}\).*|\1$existing ${add[*]}|" "$conf"
-    rm -f "$conf.bak"
+    replace_conf_line "$conf" Host "Host $existing ${add[*]}"
     info "Host $existing ${add[*]}"
 }
 
@@ -199,7 +264,7 @@ cmd_list() {
         name=$(basename "$f" .conf)
         target="$(awk '$1=="User"{u=$2} $1=="HostName"{h=$2} $1=="Port"{p=$2} \
                        END{printf "%s@%s%s", u, h, (p=="22"?"":":" p)}' "$f")"
-        id=$(awk '$1=="IdentityFile"{print $2}' "$f")
+        id=$(identity_of "$f")
         agent=""
         [[ $id == *.pub ]] && agent="  (agent)"
         printf '%-14s %-28s %s%s\n' "$name" "$target" "$(basename "$id")" "$agent"
@@ -265,7 +330,7 @@ status_one() {
     local target
     target="$(awk '$1=="User"{u=$2} $1=="HostName"{h=$2} $1=="Port"{p=$2} \
                    END{printf "%s@%s%s", u, h, (p=="22"?"":":" p)}' "$conf")"
-    local id; id=$(awk '$1=="IdentityFile"{print $2}' "$conf")
+    local id; id=$(identity_of "$conf")
     local mode="ondisk"; [[ $id == *.pub ]] && mode="agent"
 
     local priv_disk="no" pub_disk="no"
@@ -396,10 +461,9 @@ retarget() {
     local name=$1 to=$2 conf; conf=$(conffile "$name")
     local key; key=$(keyfile "$name")
     case $to in
-        agent)  sed -i.bak "s|^\([ 	]*IdentityFile[ 	]\{1,\}\).*|\1$key.pub|" "$conf" ;;
-        ondisk) sed -i.bak "s|^\([ 	]*IdentityFile[ 	]\{1,\}\).*|\1$key|"     "$conf" ;;
+        agent)  replace_conf_line "$conf" IdentityFile "IdentityFile \"$key.pub\"" ;;
+        ondisk) replace_conf_line "$conf" IdentityFile "IdentityFile \"$key\""     ;;
     esac
-    rm -f "$conf.bak"
 }
 
 cmd_agent() {
@@ -698,6 +762,7 @@ cmd_restore() {
 cmd_scope() {
     local label=${1:-}; shift 2>/dev/null || true
     [[ -n $label ]] || die "usage: skm scope <label> [-c] [-t 8h] [-d db.kdbx] <name>..."
+    require_name "$label" "scope label"
 
     local confirm=0 ttl="" db="" names=()
     while [[ $# -gt 0 ]]; do
@@ -792,6 +857,7 @@ cmd_scopes() {
 
 cmd_unscope() {
     local label=${1:-}; [[ -n $label ]] || die "usage: skm unscope <label>"
+    require_name "$label" "scope label"
     local sock="$SOCK_DIR/$label.sock" pidf="$SOCK_DIR/$label.pid"
     [[ -S $sock || -f $pidf ]] || die "no such scope: $label"
 
