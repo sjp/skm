@@ -24,6 +24,13 @@
 #                                       start an agent holding ONLY those keys
 #   skm scopes                          list scoped agents and what's in them
 #   skm unscope <label>                 kill a scoped agent
+#
+# Vault settings, taken from the environment:
+#   SKM_KEEPASS_GROUP          group the entries live in (default "SSH Keys")
+#   SKM_KEEPASS_KEYFILE        key file the database also needs to unlock
+#   SKM_KEEPASS_YUBIKEY        hardware key slot[:serial] the database needs
+#   SKM_KEEPASS_NO_PASSWORD    set for a database with no password at all
+#   SKM_KEEPASS_PASSWORD_FILE  file whose first line is the database password
 
 # Must be POSIX — it has to survive being run by sh/bash in order to complain
 # about being run by sh/bash.
@@ -43,6 +50,24 @@ CONF_DIR="$SSH_DIR/config.d"
 CONFIG="$SSH_DIR/config"
 SOCK_DIR="$SSH_DIR/agents"
 KP_GROUP="${SKM_KEEPASS_GROUP:-SSH Keys}"
+
+# A database can be locked with more than a password: a key file, a hardware
+# key, or either of those instead of one. keepassxc-cli has to be handed the
+# same combination the database was created with, so what unlocks it is
+# settled here, in one place, and reaches every vault call from there. A
+# password named in a file is read from it rather than asked for, which is
+# what lets an unattended run -- a cron health check, say -- open a database.
+KP_KEYFILE="${SKM_KEEPASS_KEYFILE:-}"
+KP_YUBIKEY="${SKM_KEEPASS_YUBIKEY:-}"
+KP_PW_FILE="${SKM_KEEPASS_PASSWORD_FILE:-}"
+
+# Any value but 0 turns it on, so that the spelling the user's other tooling
+# uses -- 1, yes, true -- means the same thing here.
+if [[ -n ${SKM_KEEPASS_NO_PASSWORD:-} && ${SKM_KEEPASS_NO_PASSWORD:-} != 0 ]]; then
+    KP_NO_PW=1
+else
+    KP_NO_PW=0
+fi
 
 # Everything this script writes is a private key, a copy of one, or a config
 # fragment naming one. Create all of it unreadable to anyone else from the
@@ -653,6 +678,10 @@ cmd_ondisk() {
 typeset -g KP_CLI=""
 typeset -g KP_PW=""
 
+# The unlock options every keepassxc-cli call carries, built once from the
+# settings at the top of the file.
+typeset -ga KP_AUTH=()
+
 # What keepassxc-cli last wrote to stderr. Kept so a caller can tell "the
 # database says no" from "the database never answered the question".
 typeset -g KP_ERR=""
@@ -675,11 +704,31 @@ kp_lookup() {
 # Settle on the binary before a vault operation starts, so a missing one stops
 # the run there instead of turning into a string of unexplained failures --
 # and, worse, an empty vault reading that looks like "the key isn't in there".
+# Turn the unlock settings into the options keepassxc-cli wants. Every
+# subcommand takes the same three, so settling them once here is what puts a
+# key-file or hardware-key database within reach of all of them. A key file
+# that isn't there is caught now: handed on, it would come back as nothing
+# more informative than a rejected password.
+kp_auth_opts() {
+    KP_AUTH=()
+    if [[ -n $KP_KEYFILE ]]; then
+        [[ -f $KP_KEYFILE ]] || die "no such KeePassXC key file: $KP_KEYFILE"
+        KP_AUTH+=(--key-file "$KP_KEYFILE")
+    fi
+    if [[ -n $KP_YUBIKEY ]]; then
+        KP_AUTH+=(--yubikey "$KP_YUBIKEY")
+    fi
+    if (( KP_NO_PW )); then
+        KP_AUTH+=(--no-password)
+    fi
+}
+
 kp_require() {
     if [[ -z $KP_CLI ]]; then
         KP_CLI=$(kp_lookup) \
             || die "keepassxc-cli not found (macOS: it lives in KeePassXC.app/Contents/MacOS)"
     fi
+    kp_auth_opts
 }
 
 # KeePassXC's agent reads two attachments from an entry:
@@ -707,14 +756,17 @@ EOF
 }
 
 # keepassxc-cli reads the database password from stdin, so we hand it the same
-# password for each subcommand rather than prompting five times. Its stderr is
-# kept rather than discarded, because "not in the database" and "could not open
-# the database" are the same exit status and only the text tells them apart.
-# The unlock prompt it writes there even when the password arrives on stdin is
-# not a diagnostic, so it is dropped.
-run_kp() {
+# password for each subcommand rather than prompting five times. The rest of
+# what unlocks the database goes in right after the subcommand name, where
+# every one of them accepts it. Its stderr is kept rather than discarded,
+# because "not in the database" and "could not open the database" are the same
+# exit status and only the text tells them apart. The unlock prompt it writes
+# there even when the password arrives on stdin is not a diagnostic, so it is
+# dropped.
+run_kp() {   # subcommand arg...
+    local sub=$1; shift
     local rc=0 err=""
-    err=$(print -r -- "$KP_PW" | "$KP_CLI" "$@" 2>&1 >/dev/null) || rc=$?
+    err=$(print -r -- "$KP_PW" | "$KP_CLI" "$sub" "${KP_AUTH[@]}" "$@" 2>&1 >/dev/null) || rc=$?
     KP_ERR=$(print -r -- "$err" | sed -e 's/^Enter password to unlock .*: //' -e '/^$/d')
     return $rc
 }
@@ -738,6 +790,29 @@ kp_absent() {
 # `drop` offer to delete the last copy of a key.
 kp_password() {   # db
     local db=$1 tries=1 i
+
+    # A database with no password of its own has nothing to ask for: the key
+    # file or the hardware key is the whole credential. It still has to be
+    # proved, for the same reason a password does.
+    if (( KP_NO_PW )); then
+        KP_PW=""
+        if run_kp db-info "$db"; then return 0; fi
+        kp_die "could not open $db"
+    fi
+
+    # A password waiting in a file is the only way a run with nobody watching
+    # it can open the database. A wrong one there is worth naming the file
+    # over, since there is no one to ask again.
+    if [[ -n $KP_PW_FILE ]]; then
+        [[ -f $KP_PW_FILE ]] || die "no such KeePassXC password file: $KP_PW_FILE"
+        KP_PW=$(head -n 1 "$KP_PW_FILE")
+        if run_kp db-info "$db"; then return 0; fi
+        KP_PW=""
+        if [[ $KP_ERR == *'Invalid credentials'* ]]; then
+            die "wrong password for $db (read from $KP_PW_FILE)"
+        fi
+        kp_die "could not open $db"
+    fi
     [[ -t 0 ]] && tries=3   # answers arriving down a pipe get a single attempt
 
     for (( i = 1; i <= tries; i++ )); do
@@ -1090,7 +1165,7 @@ cmd_scope() {
     (( confirm ))   && flags+=(-c)
     [[ -n $ttl ]]   && flags+=(-t "$ttl")
 
-    local n key tmp base_dir
+    local n key tmp base_dir rc unlocked=0
     for n in "${names[@]}"; do
         require_host "$n"
         key=$(keyfile "$n")
@@ -1102,14 +1177,28 @@ cmd_scope() {
             # /dev/shm is RAM-backed so it never hits disk — but it's a Linux
             # thing. macOS has no equivalent, so the copy is briefly on disk
             # there; we unlink it immediately after ssh-add.
-            kp_require
+            #
+            # The database is opened the once, however many keys come out of
+            # it, and by the same route as everywhere else: whatever unlocks
+            # it -- key file, hardware key, password -- works here too.
+            if (( ! unlocked )); then
+                kp_require
+                kp_password "$db"
+                unlocked=1
+            fi
             if   [[ -d ${XDG_RUNTIME_DIR:-} ]]; then base_dir=$XDG_RUNTIME_DIR
             elif [[ -d /dev/shm ]];             then base_dir=/dev/shm
             else                                     base_dir=${TMPDIR:-/tmp}
             fi
             tmp=$(mktemp -d "$base_dir/skm.XXXXXX")
             chmod 700 "$tmp"
-            "$KP_CLI" attachment-export "$db" "$KP_GROUP/$n" "${key:t}" "$tmp/$n"
+            rc=0
+            kp_attachment_export "$db" "$KP_GROUP/$n" "${key:t}" "$tmp/$n" || rc=$?
+            case $rc in
+                0) ;;
+                1) rm -rf "$tmp"; die "no key attachment for '$n' in $KP_GROUP/$n" ;;
+                *) rm -rf "$tmp"; kp_die "could not read $db" ;;
+            esac
             chmod 600 "$tmp/$n"
             ssh-add "${flags[@]}" "$tmp/$n"
             rm -rf "$tmp"
@@ -1170,7 +1259,7 @@ cmd_unscope() {
 # from there keeps the two from drifting apart. $0 inside a zsh function is the
 # function's own name, so the script's path has to be captured out here.
 SKM_SELF=$0
-usage() { sed -n '3,26p' "$SKM_SELF" | sed 's/^# \?//' }
+usage() { sed -n '3,33p' "$SKM_SELF" | sed 's/^# \?//' }
 
 case "${1:-help}" in
     add)       shift; cmd_add       "$@" ;;

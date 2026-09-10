@@ -381,3 +381,80 @@ teardown() { skm_teardown; }
     assert_output_has "could not open"
     assert_output_lacks "vault: no"
 }
+
+# ------------------------------------------- other ways into the database
+#
+# A database can want a key file as well as its password, or instead of one,
+# and a run with nobody at the terminal has to get the password from a file.
+# Every one of those has to reach keepassxc-cli or the database stays shut.
+
+# A database that takes a key file as well as a password.
+make_keyfile_vault() {
+    KEY_FILE="$SKM_TMP/vault.key"
+    KEY_DB="$SKM_TMP/keyfile.kdbx"
+    head -c 64 /dev/urandom > "$KEY_FILE"
+    printf '%s\n%s\n' "$DB_PW" "$DB_PW" \
+        | kp_cli db-create -p --set-key-file "$KEY_FILE" "$KEY_DB" >/dev/null
+}
+
+@test "a database that also wants a key file opens once the key file is named" {
+    add_host box
+    make_keyfile_vault
+
+    run skm_answer "$DB_PW" -- export box "$KEY_DB"
+    assert_fails
+    assert_output_lacks "exported box"
+
+    export SKM_KEEPASS_KEYFILE="$KEY_FILE"
+    run skm_answer "$DB_PW" -- export box "$KEY_DB"
+    assert_ok
+    assert_output_has "exported box"
+}
+
+@test "a key file that is not there is named rather than read as a bad password" {
+    add_host box
+    export SKM_KEEPASS_KEYFILE="$SKM_TMP/missing.key"
+
+    run skm_answer "$DB_PW" -- status box "$DB"
+    assert_fails
+    assert_output_has "no such KeePassXC key file"
+    assert_output_lacks "wrong password"
+}
+
+@test "a database with no password of its own needs no answer at the prompt" {
+    add_host box
+    local kf="$SKM_TMP/only.key" db="$SKM_TMP/nopassword.kdbx"
+    head -c 64 /dev/urandom > "$kf"
+    kp_cli db-create --set-key-file "$kf" "$db" >/dev/null
+
+    export SKM_KEEPASS_KEYFILE="$kf" SKM_KEEPASS_NO_PASSWORD=1
+    run skm export box "$db"      # nothing on stdin at all
+    assert_ok
+    assert_output_has "exported box"
+}
+
+@test "the password can come from a file instead of the prompt" {
+    add_host box
+    printf '%s\n' "$DB_PW" > "$SKM_TMP/pw.txt"
+    export SKM_KEEPASS_PASSWORD_FILE="$SKM_TMP/pw.txt"
+
+    run skm export box "$DB"
+    assert_ok
+    assert_output_has "exported box"
+
+    run skm status box "$DB"
+    assert_ok
+    assert_output_has "vault: yes"
+}
+
+@test "a wrong password in the file is reported against the file" {
+    add_host box
+    printf 'not the password\n' > "$SKM_TMP/pw.txt"
+    export SKM_KEEPASS_PASSWORD_FILE="$SKM_TMP/pw.txt"
+
+    run skm status box "$DB"
+    assert_fails
+    assert_output_has "wrong password"
+    assert_output_has "pw.txt"
+    assert_output_lacks "LOST"
+}

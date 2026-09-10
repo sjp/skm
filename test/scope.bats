@@ -156,3 +156,19 @@ agent_fingerprints() {
     assert_equal "$(agent_fingerprints work)" "$fp"
     assert_no_file "$(keyfile box)"
 }
+
+@test "a scoped vault key opens the database the same way every command does" {
+    require_keepassxc
+    make_vault
+    add_host box
+    local fp; fp=$(fingerprint "$(keyfile box)")
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    skm_answer "$DB_PW" y -- drop box "$DB" >/dev/null
+
+    printf '%s\n' "$DB_PW" > "$SKM_TMP/pw.txt"
+    export SKM_KEEPASS_PASSWORD_FILE="$SKM_TMP/pw.txt"
+
+    run skm scope work -d "$DB" box     # nothing on stdin
+    assert_ok
+    assert_equal "$(agent_fingerprints work)" "$fp"
+}
