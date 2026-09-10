@@ -33,6 +33,13 @@ CONFIG="$SSH_DIR/config"
 SOCK_DIR="$SSH_DIR/agents"
 KP_GROUP="${SKM_KEEPASS_GROUP:-SSH Keys}"
 
+# Everything this script writes is a private key, a copy of one, or a config
+# fragment naming one. Create all of it unreadable to anyone else from the
+# outset: a file made world-readable and tightened a moment later is readable
+# by any local user in between. The chmod calls further down cover paths that
+# already existed when skm found them.
+umask 077
+
 die()  { printf 'skm: %s\n' "$*" >&2; exit 1; }
 info() { printf '  %s\n' "$*"; }
 
@@ -647,13 +654,10 @@ cmd_restore() {
         || die "no key attachment for '$name' in $entry"
     chmod 600 "$key"
 
-    if printf '%s\n' "$pw" | "$kpcli" attachment-export "$db" "$entry" "$base.pub" "$key.pub" \
-            2>/dev/null; then
-        chmod 644 "$key.pub"
-    elif [[ ! -f $key.pub ]]; then
+    if ! printf '%s\n' "$pw" | "$kpcli" attachment-export "$db" "$entry" "$base.pub" \
+            "$key.pub" 2>/dev/null && [[ ! -f $key.pub ]]; then
         info "no public key attachment in $entry; regenerating from the private key"
         ssh-keygen -y -f "$key" > "$key.pub"
-        chmod 644 "$key.pub"
     fi
 
     retarget "$name" ondisk

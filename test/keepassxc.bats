@@ -196,7 +196,20 @@ teardown() { skm_teardown; }
     run skm_answer "$DB_PW" -- restore box "$DB"
     assert_ok
     assert_mode "$(keyfile box)" 600
-    assert_mode "$(keyfile box).pub" 644
+    assert_mode "$(keyfile box).pub" 600
+}
+
+@test "restore writes the key private rather than widening it afterwards" {
+    umask 022   # a permissive caller must not loosen anything skm writes
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    skm_answer "$DB_PW" y -- drop box "$DB" >/dev/null
+    rm -f "$(keyfile box).pub"
+
+    PATH="$NOCHMOD:$PATH" skm_answer "$DB_PW" -- restore box "$DB" >/dev/null
+
+    assert_mode "$(keyfile box)" 600
+    assert_mode "$(keyfile box).pub" 600
 }
 
 @test "restore refuses to overwrite a key that is already on disk" {

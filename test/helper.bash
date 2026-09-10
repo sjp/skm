@@ -30,6 +30,14 @@ skm_setup() {
 
     DB="$SKM_TMP/vault.kdbx"
     DB_PW='correct horse'   # a space, because passwords have them
+
+    # A PATH entry whose `chmod` does nothing. Prefixing it lets a test see the
+    # mode a file was *created* with, rather than one applied to it afterwards:
+    #     PATH="$NOCHMOD:$PATH" skm add box user@example.com
+    NOCHMOD="$SKM_TMP/nochmod"
+    mkdir -p "$NOCHMOD"
+    printf '#!/bin/sh\nexit 0\n' > "$NOCHMOD/chmod"
+    chmod +x "$NOCHMOD/chmod"
 }
 
 skm_teardown() {

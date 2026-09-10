@@ -40,10 +40,23 @@ teardown() { skm_teardown; }
 @test "add gives the key, the config and the directories restrictive modes" {
     add_host box
     assert_mode "$(keyfile box)" 600
+    assert_mode "$(keyfile box).pub" 600
     assert_mode "$(conffile box)" 600
     assert_mode "$SSH_DIR" 700
     assert_mode "$SSH_DIR/config.d" 700
     assert_mode "$SSH_DIR/config" 600
+}
+
+@test "add creates its files private rather than widening them afterwards" {
+    umask 022   # a permissive caller must not loosen anything skm writes
+
+    PATH="$NOCHMOD:$PATH" skm add box user@example.com >/dev/null 2>&1
+
+    assert_mode "$(keyfile box)" 600
+    assert_mode "$(keyfile box).pub" 600
+    assert_mode "$(conffile box)" 600
+    assert_mode "$SSH_DIR/config" 600
+    assert_mode "$SSH_DIR/config.d" 700
 }
 
 @test "add refuses a destination that is not user@host" {

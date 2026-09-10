@@ -46,6 +46,7 @@ agent_fingerprints() {
     assert_ok
 
     assert_mode "$SSH_DIR/agents" 700
+    assert_mode "$SSH_DIR/agents/work.pid" 600
     assert_output_has "$(sock_for work)"
     assert_output_has '"SSH_AUTH_SOCK": "/ssh-agent"'
 }
