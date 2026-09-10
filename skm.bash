@@ -45,8 +45,9 @@ ensure_include() {
 
     # Include must sit at the very top: ssh_config is first-match-wins, so a
     # later Include would be shadowed by any earlier catch-all Host block.
-    if ! grep -qE '^\s*Include\s+config\.d/' "$CONFIG"; then
-        printf 'Include config.d/*.conf\n\n%s' "$(cat "$CONFIG")" > "$CONFIG.tmp"
+    if ! grep -qE '^[[:space:]]*Include[[:space:]]+config\.d/' "$CONFIG"; then
+        printf 'Include config.d/*.conf\n\n' > "$CONFIG.tmp"
+        cat "$CONFIG" >> "$CONFIG.tmp"
         mv "$CONFIG.tmp" "$CONFIG"
         chmod 600 "$CONFIG"
         info "added 'Include config.d/*.conf' to $CONFIG"
@@ -171,7 +172,7 @@ cmd_alias() {
     done
     [[ ${#add[@]} -gt 0 ]] || { info "already matched by: Host $existing"; return; }
 
-    sed -i.bak "s|^\([ \t]*Host[ \t]\+\).*|\1$existing ${add[*]}|" "$conf"
+    sed -i.bak "s|^\([ 	]*Host[ 	]\{1,\}\).*|\1$existing ${add[*]}|" "$conf"
     rm -f "$conf.bak"
     info "Host $existing ${add[*]}"
 }
@@ -243,7 +244,7 @@ status_verdict() {
 }
 
 status_one() {
-    local name=$1 db=$2 pw=$3
+    local name=$1 db=$2 pw=$3 kpcli=$4
     local conf; conf=$(conffile "$name")
     local key; key=$(keyfile "$name")
     local pub="$key.pub"
@@ -265,14 +266,14 @@ status_one() {
     if [[ -n $db ]]; then
         local entry="$KP_GROUP/$name" base; base=$(basename "$key")
         local tmpdir; tmpdir=$(ramtemp)
-        if printf '%s\n' "$pw" | keepassxc-cli attachment-export "$db" "$entry" "$base" \
+        if printf '%s\n' "$pw" | "$kpcli" attachment-export "$db" "$entry" "$base" \
                 "$tmpdir/$base" 2>/dev/null; then
             priv_vault="yes"
             vault_fp=$(key_fingerprint "$tmpdir/$base")
         else
             priv_vault="no"
         fi
-        if printf '%s\n' "$pw" | keepassxc-cli attachment-export "$db" "$entry" "$base.pub" \
+        if printf '%s\n' "$pw" | "$kpcli" attachment-export "$db" "$entry" "$base.pub" \
                 "$tmpdir/$base.pub" 2>/dev/null; then
             pub_vault="yes"
         else
@@ -338,14 +339,15 @@ cmd_status() {
         names=("$what")
     fi
 
-    local pw=""
+    local pw="" kpcli=""
     if [[ -n $db ]]; then
-        command -v keepassxc-cli >/dev/null || die "keepassxc-cli not found"
-        read -rsp "KeePassXC database password: " pw; echo
+        kpcli=$(kp_bin)
+        read -rsp "KeePassXC database password: " pw || die "no password given"
+        echo   # -s ate the newline
     fi
 
     local n
-    for n in "${names[@]}"; do status_one "$n" "$db" "$pw"; done
+    for n in "${names[@]}"; do status_one "$n" "$db" "$pw" "$kpcli"; done
 }
 
 cmd_show() { require_host "$1"; cat "$(keyfile "$1").pub"; }
@@ -357,7 +359,12 @@ cmd_copy() {
 
 cmd_rm() {
     local name=${1:-}; require_host "$name"
-    read -rp "delete key and config for '$name'? [y/N] " ans
+
+    # The `||` matters: at EOF (piped or non-interactive input) read returns
+    # non-zero, which under `set -e` would otherwise kill the script mid-way
+    # with no explanation.
+    local ans=""
+    read -rp "delete key and config for '$name'? [y/N] " ans || ans=""
     [[ ${ans,,} == y* ]] || { info "aborted"; return; }
     rm -f "$(conffile "$name")" "$(keyfile "$name")" "$(keyfile "$name").pub"
     info "removed $name"
@@ -370,8 +377,8 @@ retarget() {
     local name=$1 to=$2 conf; conf=$(conffile "$name")
     local key; key=$(keyfile "$name")
     case $to in
-        agent)  sed -i.bak "s|^\(\s*IdentityFile\s\+\).*|\1$key.pub|" "$conf" ;;
-        ondisk) sed -i.bak "s|^\(\s*IdentityFile\s\+\).*|\1$key|"     "$conf" ;;
+        agent)  sed -i.bak "s|^\([ 	]*IdentityFile[ 	]\{1,\}\).*|\1$key.pub|" "$conf" ;;
+        ondisk) sed -i.bak "s|^\([ 	]*IdentityFile[ 	]\{1,\}\).*|\1$key|"     "$conf" ;;
     esac
     rm -f "$conf.bak"
 }
@@ -384,6 +391,18 @@ cmd_ondisk() { require_host "$1"; retarget "$1" ondisk
                info "$1 now reads $(keyfile "$1") directly"; }
 
 # ---------------------------------------------------------------- keepassxc
+
+# On macOS, keepassxc-cli ships inside the app bundle and isn't on PATH unless
+# you installed via Homebrew. Find it either way.
+kp_bin() {
+    if command -v keepassxc-cli >/dev/null 2>&1; then
+        command -v keepassxc-cli
+    elif [[ -x /Applications/KeePassXC.app/Contents/MacOS/keepassxc-cli ]]; then
+        printf '%s\n' /Applications/KeePassXC.app/Contents/MacOS/keepassxc-cli
+    else
+        die "keepassxc-cli not found (macOS: it lives in KeePassXC.app/Contents/MacOS)"
+    fi
+}
 
 # KeePassXC's agent reads two attachments from an entry:
 #   - the private key itself
@@ -409,8 +428,8 @@ keeagent_xml() {
 EOF
 }
 
-kp_entry_exists() {   # db entry pw  ->  0 if the entry is present
-    printf '%s\n' "$3" | keepassxc-cli show "$1" "$2" >/dev/null 2>&1
+kp_entry_exists() {   # db entry pw kpcli  ->  0 if the entry is present
+    printf '%s\n' "$3" | "$4" show "$1" "$2" >/dev/null 2>&1
 }
 
 # SHA256 fingerprint only (no comment/bit-count noise), so a match is a real
@@ -441,7 +460,7 @@ ramtemp() {   # -> path to a fresh 0700 dir, RAM-backed if the platform has one
 }
 
 export_one() {
-    local name=$1 db=$2 pw=$3 force=${4:-0}
+    local name=$1 db=$2 pw=$3 kpcli=$4 force=${5:-0}
     local key; key=$(keyfile "$name")
     local entry="$KP_GROUP/$name"
     local base; base=$(basename "$key")
@@ -451,15 +470,14 @@ export_one() {
 
     local pub="$key.pub"
     if [[ ! -f $pub ]]; then
-        pubtmp=$(mktemp)
+        pubtmp=$(mktemp "${TMPDIR:-/tmp}/skm.XXXXXX")
         ssh-keygen -y -f "$key" > "$pubtmp"
         pub=$pubtmp
     fi
 
-    local kp=(keepassxc-cli)
     # keepassxc-cli reads the database password from stdin, so we hand it the
     # same password for each subcommand rather than prompting five times.
-    run_kp() { printf '%s\n' "$pw" | "${kp[@]}" "$@" >/dev/null; }
+    run_kp() { printf '%s\n' "$pw" | "$kpcli" "$@" >/dev/null; }
 
     run_kp mkdir  "$db" "$KP_GROUP" 2>/dev/null || true
     run_kp add    "$db" "$entry" --url "ssh://$name" 2>/dev/null || \
@@ -473,7 +491,7 @@ export_one() {
         run_kp attachment-rm "$db" "$entry" "KeeAgent.settings" 2>/dev/null || true
     fi
 
-    local tmp; tmp=$(mktemp)
+    local tmp; tmp=$(mktemp "${TMPDIR:-/tmp}/skm.XXXXXX")   # BSD mktemp needs a template
     keeagent_xml "$base" > "$tmp"
 
     run_kp attachment-import "$db" "$entry" "$base"            "$key"
@@ -485,7 +503,7 @@ export_one() {
 }
 
 cmd_export() {
-    command -v keepassxc-cli >/dev/null || die "keepassxc-cli not found"
+    local kpcli; kpcli=$(kp_bin)
 
     local force=0 args=()
     while [[ $# -gt 0 ]]; do
@@ -509,29 +527,32 @@ cmd_export() {
         require_host "$what"; names=("$what")
     fi
 
-    read -rsp "KeePassXC database password: " pw; echo
+    local pw=""
+    read -rsp "KeePassXC database password: " pw || die "no password given"
+    echo   # -s ate the newline
 
     if ((! force)); then
         local n existing=()
         for n in "${names[@]}"; do
-            kp_entry_exists "$db" "$KP_GROUP/$n" "$pw" && existing+=("$n")
+            kp_entry_exists "$db" "$KP_GROUP/$n" "$pw" "$kpcli" && existing+=("$n")
         done
         [[ ${#existing[@]} -eq 0 ]] || \
             die "already in KeePassXC: ${existing[*]}  (re-run with --force to overwrite)"
     fi
 
     local n
-    for n in "${names[@]}"; do export_one "$n" "$db" "$pw" "$force"; done
+    for n in "${names[@]}"; do export_one "$n" "$db" "$pw" "$kpcli" "$force"; done
 
     echo
     info "next: in KeePassXC, enable Tools > Settings > SSH Agent, then re-unlock the database."
+    info "the entry's Password field must hold the key's passphrase, or it can't decrypt it."
     info "verify with 'ssh-add -l', then run 'skm agent <name>' and delete the on-disk key."
 }
 
 # Delete the on-disk private key so it lives only in KeePassXC. Deliberately
 # single-key (no --all): this is meant to require real consideration each time.
 cmd_drop() {
-    command -v keepassxc-cli >/dev/null || die "keepassxc-cli not found"
+    local kpcli; kpcli=$(kp_bin)
 
     local force=0 args=()
     while [[ $# -gt 0 ]]; do
@@ -551,14 +572,16 @@ cmd_drop() {
 
     local entry="$KP_GROUP/$name" base; base=$(basename "$key")
 
-    read -rsp "KeePassXC database password: " pw; echo
+    local pw=""
+    read -rsp "KeePassXC database password: " pw || die "no password given"
+    echo   # -s ate the newline
 
     local have; have=$(key_fingerprint "$key")
     [[ -n $have ]] || die "could not read local key: $key"
 
     local tmpdir; tmpdir=$(ramtemp)
     local vault_key="$tmpdir/$base" vault_fp=""
-    if printf '%s\n' "$pw" | keepassxc-cli attachment-export "$db" "$entry" "$base" "$vault_key" \
+    if printf '%s\n' "$pw" | "$kpcli" attachment-export "$db" "$entry" "$base" "$vault_key" \
             2>/dev/null; then
         vault_fp=$(key_fingerprint "$vault_key")
     fi
@@ -568,9 +591,10 @@ cmd_drop() {
     info "local:  $have"
     info "vault:  ${vault_fp:-(not found in KeePassXC)}"
 
+    local ans=""
     if [[ -n $vault_fp && $vault_fp == "$have" ]]; then
         info "fingerprints match -- reversible via 'skm restore $name $db'"
-        read -rp "delete local private key for '$name'? [y/N] " ans
+        read -rp "delete local private key for '$name'? [y/N] " ans || ans=""
         [[ ${ans,,} == y* ]] || { info "aborted"; return; }
     else
         if [[ -z $vault_fp ]]; then
@@ -579,7 +603,7 @@ cmd_drop() {
             info "DANGER: fingerprints differ -- the vault copy is NOT this key"
         fi
         ((force)) || die "refusing to delete (re-run with --force if you're sure)"
-        read -rp "this cannot be undone -- really delete '$key'? [y/N] " ans
+        read -rp "this cannot be undone -- really delete '$key'? [y/N] " ans || ans=""
         [[ ${ans,,} == y* ]] || { info "aborted"; return; }
     fi
 
@@ -593,7 +617,7 @@ cmd_drop() {
 # Inverse of drop: pull the private key back out of KeePassXC onto disk, in
 # the layout skm expects, and flip the config back to on-disk.
 cmd_restore() {
-    command -v keepassxc-cli >/dev/null || die "keepassxc-cli not found"
+    local kpcli; kpcli=$(kp_bin)
 
     local force=0 args=()
     while [[ $# -gt 0 ]]; do
@@ -615,13 +639,15 @@ cmd_restore() {
 
     local entry="$KP_GROUP/$name" base; base=$(basename "$key")
 
-    read -rsp "KeePassXC database password: " pw; echo
+    local pw=""
+    read -rsp "KeePassXC database password: " pw || die "no password given"
+    echo   # -s ate the newline
 
-    printf '%s\n' "$pw" | keepassxc-cli attachment-export "$db" "$entry" "$base" "$key" 2>/dev/null \
+    printf '%s\n' "$pw" | "$kpcli" attachment-export "$db" "$entry" "$base" "$key" 2>/dev/null \
         || die "no key attachment for '$name' in $entry"
     chmod 600 "$key"
 
-    if printf '%s\n' "$pw" | keepassxc-cli attachment-export "$db" "$entry" "$base.pub" "$key.pub" \
+    if printf '%s\n' "$pw" | "$kpcli" attachment-export "$db" "$entry" "$base.pub" "$key.pub" \
             2>/dev/null; then
         chmod 644 "$key.pub"
     elif [[ ! -f $key.pub ]]; then
@@ -680,7 +706,7 @@ cmd_scope() {
     ((confirm))    && flags+=(-c)
     [[ -n $ttl ]]  && flags+=(-t "$ttl")
 
-    local n key tmp
+    local n key tmp base_dir kpcli
     for n in "${names[@]}"; do
         require_host "$n"
         key=$(keyfile "$n")
@@ -688,13 +714,18 @@ cmd_scope() {
         if [[ -f $key ]]; then
             ssh-add "${flags[@]}" "$key"
         elif [[ -n $db ]]; then
-            # Key lives in KeePassXC only. Pull it into memory-backed storage,
-            # load it, wipe it. /dev/shm never touches the disk.
-            command -v keepassxc-cli >/dev/null || die "keepassxc-cli not found"
-            tmp=$(mktemp -d "${XDG_RUNTIME_DIR:-/dev/shm}/skm.XXXXXX" 2>/dev/null) \
-                || tmp=$(mktemp -d)
+            # Key lives in KeePassXC only. Pull it out, load it, wipe it.
+            # /dev/shm is RAM-backed so it never hits disk — but it's a Linux
+            # thing. macOS has no equivalent, so the copy is briefly on disk
+            # there; we unlink it immediately after ssh-add.
+            kpcli=$(kp_bin)
+            if   [[ -d ${XDG_RUNTIME_DIR:-} ]]; then base_dir=$XDG_RUNTIME_DIR
+            elif [[ -d /dev/shm ]];             then base_dir=/dev/shm
+            else                                     base_dir=${TMPDIR:-/tmp}
+            fi
+            tmp=$(mktemp -d "$base_dir/skm.XXXXXX")
             chmod 700 "$tmp"
-            keepassxc-cli attachment-export "$db" "$KP_GROUP/$n" \
+            "$kpcli" attachment-export "$db" "$KP_GROUP/$n" \
                 "$(basename "$key")" "$tmp/$n"
             chmod 600 "$tmp/$n"
             ssh-add "${flags[@]}" "$tmp/$n"
