@@ -856,7 +856,7 @@ ramtemp() {   # -> path to a fresh 0700 dir, RAM-backed if the platform has one
 }
 
 export_one() {
-    local name=$1 db=$2 force=${3:-0}
+    local name=$1 db=$2 exists=${3:-0}
     local key; key=$(keyfile "$name")
     local entry="$KP_GROUP/$name"
     local base; base=$(basename "$key")
@@ -871,39 +871,29 @@ export_one() {
         pub=$pubtmp
     fi
 
-    # The group is shared by every exported key, so from the second export on
-    # "already exists" is the expected answer and the only tolerable failure.
-    run_kp mkdir "$db" "$KP_GROUP" || [[ $KP_ERR == *'already exists'* ]] \
-        || kp_die "could not create group '$KP_GROUP' in $db"
-
-    # Say the entry is already there only once that has actually been looked
-    # up: a failing `add` on its own is just as likely to mean the database
-    # could not be written at all.
-    if ! run_kp add "$db" "$entry" --url "ssh://$name"; then
-        local rc=0
-        kp_entry_exists "$db" "$entry" || rc=$?
-        ((rc == 0)) || kp_die "could not create entry '$entry'"
+    # Whether the entry is already there was settled by the caller's one
+    # lookup, so only a genuinely new entry costs an `add`. Asking `add`
+    # itself would answer nothing: it reports a duplicate and an unwritable
+    # database with the same "could not create entry".
+    if ((exists)); then
         info "entry '$entry' exists, updating attachments"
-    fi
-
-    # attachment-import refuses to clobber an attachment that's already there,
-    # so on --force strip the old ones first (no-op if this is a fresh entry).
-    if ((force)); then
-        local a
-        for a in "$base" "$base.pub" KeeAgent.settings; do
-            run_kp attachment-rm "$db" "$entry" "$a" || kp_absent \
-                || kp_die "could not remove attachment '$a' from '$entry'"
-        done
+    else
+        run_kp add "$db" "$entry" --url "ssh://$name" \
+            || kp_die "could not create entry '$entry'"
     fi
 
     local tmp; tmp=$(mktemp "${TMPDIR:-/tmp}/skm.XXXXXX")   # BSD mktemp needs a template
     keeagent_xml "$base" > "$tmp"
 
-    run_kp attachment-import "$db" "$entry" "$base"             "$key" \
+    # -f replaces an attachment that is already stored, which is what updating
+    # an existing entry needs; on a fresh entry it makes no difference. Every
+    # unlock costs a run of the database's key derivation, so the three
+    # imports below are the whole cost of writing a key.
+    run_kp attachment-import -f "$db" "$entry" "$base"             "$key" \
         || kp_die "could not store '$base' in '$entry'"
-    run_kp attachment-import "$db" "$entry" "$base.pub"         "$pub" \
+    run_kp attachment-import -f "$db" "$entry" "$base.pub"         "$pub" \
         || kp_die "could not store '$base.pub' in '$entry'"
-    run_kp attachment-import "$db" "$entry" "KeeAgent.settings" "$tmp" \
+    run_kp attachment-import -f "$db" "$entry" "KeeAgent.settings" "$tmp" \
         || kp_die "could not store 'KeeAgent.settings' in '$entry'"
     rm -f "$tmp" "$pubtmp"
 
@@ -936,23 +926,30 @@ cmd_export() {
     kp_require
     kp_password "$db"
 
-    if ((! force)); then
-        local n rc existing=()
-        for n in "${names[@]}"; do
-            rc=0
-            kp_entry_exists "$db" "$KP_GROUP/$n" || rc=$?
-            case $rc in
-                0) existing+=("$n") ;;
-                1) ;;
-                *) kp_die "could not read $db" ;;
-            esac
-        done
-        [[ ${#existing[@]} -eq 0 ]] || \
-            die "already in KeePassXC: ${existing[*]}  (re-run with --force to overwrite)"
-    fi
+    # One lookup per name, before anything is written: it says which entries a
+    # plain export would overwrite, and it saves every export the `add` that a
+    # name already in the database doesn't need.
+    local n rc stored=() existing=()
+    for n in "${names[@]}"; do
+        rc=0
+        kp_entry_exists "$db" "$KP_GROUP/$n" || rc=$?
+        case $rc in
+            0) stored+=(1); existing+=("$n") ;;
+            1) stored+=(0) ;;
+            *) kp_die "could not read $db" ;;
+        esac
+    done
+    ((force)) || [[ ${#existing[@]} -eq 0 ]] || \
+        die "already in KeePassXC: ${existing[*]}  (re-run with --force to overwrite)"
 
-    local n
-    for n in "${names[@]}"; do export_one "$n" "$db" "$force"; done
+    # The group holds every exported key, so it is created once for the run
+    # rather than once per key. From the second run on "already exists" is the
+    # expected answer and the only tolerable failure.
+    run_kp mkdir "$db" "$KP_GROUP" || [[ $KP_ERR == *'already exists'* ]] \
+        || kp_die "could not create group '$KP_GROUP' in $db"
+
+    local i
+    for i in "${!names[@]}"; do export_one "${names[i]}" "$db" "${stored[i]}"; done
     KP_PW=""
 
     echo

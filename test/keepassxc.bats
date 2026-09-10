@@ -87,6 +87,45 @@ teardown() { skm_teardown; }
     assert_output_has "usage: skm export"
 }
 
+@test "export --all creates the group once, whatever the number of keys" {
+    add_host box
+    add_host tin
+    kp_shim_setup
+
+    PATH="$KP_SHIM:$PATH" skm_answer "$DB_PW" -- export --all "$DB" >/dev/null
+    assert_equal "$(kp_calls_of mkdir)" 1
+}
+
+@test "export --force rewrites an entry without a removal pass or a second add" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+
+    kp_shim_setup
+    PATH="$KP_SHIM:$PATH" skm_answer "$DB_PW" -- export --force box "$DB" >/dev/null
+
+    # The attachments are replaced where they stand, and the entry is known to
+    # exist before the run starts, so neither costs a database unlock.
+    assert_equal "$(kp_calls_of attachment-rm)" 0
+    assert_equal "$(kp_calls_of add)" 0
+
+    run vault_attachments "SSH Keys/box"
+    assert_output_has "id_ed25519_box"
+    assert_output_has "id_ed25519_box.pub"
+    assert_output_has "KeeAgent.settings"
+}
+
+@test "storing a key costs a bounded number of database unlocks" {
+    add_host box
+    kp_shim_setup
+
+    PATH="$KP_SHIM:$PATH" skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    # password check, one lookup, the group, the entry, its three attachments
+    [ "$(kp_calls)" -le 7 ] || {
+        printf 'export box took %s unlocks:\n%s\n' "$(kp_calls)" "$(cat "$KP_CALLS")" >&2
+        return 1
+    }
+}
+
 @test "export rejects an unknown flag" {
     add_host box
     run skm_answer "$DB_PW" -- export --wat box "$DB"

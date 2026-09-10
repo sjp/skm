@@ -140,6 +140,36 @@ vault_export_key() {
         "id_ed25519_$name" "$dest" >/dev/null 2>&1
 }
 
+# Every keepassxc-cli run unlocks the database from scratch, and unlocking is
+# the slow part, so the vault commands are also judged by how many runs they
+# need. This PATH entry records each subcommand before handing it to the real
+# binary:
+#     kp_shim_setup
+#     PATH="$KP_SHIM:$PATH" skm_answer "$DB_PW" -- export box "$DB"
+#     [ "$(kp_calls)" -le 6 ]
+kp_shim_setup() {
+    KP_SHIM="$SKM_TMP/kp-shim"
+    KP_CALLS="$SKM_TMP/kp-calls"
+    local real
+    if command -v keepassxc-cli >/dev/null 2>&1; then
+        real=$(command -v keepassxc-cli)
+    else
+        real=$KP_APP_BUNDLE
+    fi
+    mkdir -p "$KP_SHIM"
+    cat > "$KP_SHIM/keepassxc-cli" <<SHIM
+#!/bin/sh
+printf '%s\\n' "\$1" >> "$KP_CALLS"
+exec "$real" "\$@"
+SHIM
+    chmod +x "$KP_SHIM/keepassxc-cli"
+    : > "$KP_CALLS"
+}
+
+# Calls since the last kp_shim_setup: all of them, or just one subcommand's.
+kp_calls()    { wc -l < "$KP_CALLS" | tr -d ' '; }
+kp_calls_of() { grep -c "^$1\$" "$KP_CALLS" || true; }
+
 # ------------------------------------------------------------- assertions
 #
 # These read $status and $output, which bats' `run` sets in the caller.
