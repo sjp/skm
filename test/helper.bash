@@ -140,6 +140,16 @@ vault_export_key() {
         "id_ed25519_$name" "$dest" >/dev/null 2>&1
 }
 
+# The Password field of an entry: where KeePassXC's agent looks for the
+# passphrase that decrypts the key stored alongside it.
+vault_password() {
+    printf '%s\n' "$DB_PW" | kp_cli show -s "$DB" "$1" 2>/dev/null |
+        sed -n 's/^Password: //p'
+}
+
+# Give a managed key a passphrase, the way a user who wants one would.
+encrypt_key() { ssh-keygen -q -p -P '' -N "$2" -f "$(keyfile "$1")" >/dev/null; }
+
 # Every keepassxc-cli run unlocks the database from scratch, and unlocking is
 # the slow part, so the vault commands are also judged by how many runs they
 # need. This PATH entry records each subcommand before handing it to the real

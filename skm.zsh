@@ -296,7 +296,7 @@ cmd_add() {
     [[ -e $key  ]] && die "key already exists: $key"
     [[ -e $conf ]] && die "host already managed: $name"
 
-    info "generating key (leave the passphrase empty only if you'll store it in KeePassXC)"
+    info "generating key -- a passphrase is fine: 'skm export' stores it in the vault entry"
     ssh-keygen -t ed25519 -f "$key" -C "$name@$(hostname -s)-$(date +%Y%m%d)"
 
     cat > "$conf" <<EOF
@@ -678,6 +678,10 @@ cmd_ondisk() {
 typeset -g KP_CLI=""
 typeset -g KP_PW=""
 
+# The passphrase of the key currently being exported, for as long as that
+# takes. Empty for a key that has none.
+typeset -g KEY_PASS=""
+
 # The unlock options every keepassxc-cli call carries, built once from the
 # settings at the top of the file.
 typeset -ga KP_AUTH=()
@@ -760,15 +764,27 @@ EOF
 # what unlocks the database goes in right after the subcommand name, where
 # every one of them accepts it. Its stderr is kept rather than discarded,
 # because "not in the database" and "could not open the database" are the same
-# exit status and only the text tells them apart. The unlock prompt it writes
-# there even when the password arrives on stdin is not a diagnostic, so it is
-# dropped.
-run_kp() {   # subcommand arg...
-    local sub=$1; shift
+# exit status and only the text tells them apart. The prompts it writes there
+# even when the answers arrive on stdin are not diagnostics, so both the
+# unlock one and the one asking for an entry's own password are dropped.
+kp_call() {   # stdin-text subcommand arg...
+    local input=$1 sub=$2; shift 2
     local rc=0 err=""
-    err=$(print -r -- "$KP_PW" | "$KP_CLI" "$sub" "${KP_AUTH[@]}" "$@" 2>&1 >/dev/null) || rc=$?
-    KP_ERR=$(print -r -- "$err" | sed -e 's/^Enter password to unlock .*: //' -e '/^$/d')
+    err=$(print -r -- "$input" | "$KP_CLI" "$sub" "${KP_AUTH[@]}" "$@" 2>&1 >/dev/null) || rc=$?
+    KP_ERR=$(print -r -- "$err" | sed -e 's/^Enter password to unlock .*: //' \
+                                     -e 's/^Enter [a-z ]*password for[^:]*: //' -e '/^$/d')
     return $rc
+}
+
+run_kp() {   # subcommand arg...
+    kp_call "$KP_PW" "$@"
+}
+
+# `add -p` and `edit -p` ask for one more secret -- the password to store in
+# the entry itself -- and read it from the line after the database password.
+run_kp_entry_pw() {   # entry-password subcommand arg...
+    local pw=$1; shift
+    kp_call "$KP_PW"$'\n'"$pw" "$@"
 }
 
 # Stop, quoting keepassxc rather than guessing. Guessing is how an unreadable
@@ -856,6 +872,29 @@ key_fingerprint() {   # file -> "SHA256:..."  (prints nothing on failure)
     ssh-keygen -lf "$1" 2>/dev/null | awk '{print $2}' || true
 }
 
+# What decrypts a key: nothing at all, or a passphrase only the user knows.
+# KeePassXC's agent takes that passphrase from the entry's Password field, so
+# an entry holding the wrong one stores a key it can never serve -- and the
+# only sign of it is a key quietly missing from the agent, hours later. The
+# answer is proved against the key itself before it goes near the vault.
+key_passphrase() {   # key -> sets KEY_PASS
+    local key=$1 name=${key:t} tries=1 i
+    KEY_PASS=""
+    if ssh-keygen -y -P "" -f "$key" >/dev/null 2>&1; then return 0; fi
+
+    [[ -t 0 ]] && tries=3   # answers arriving down a pipe get a single attempt
+    for (( i = 1; i <= tries; i++ )); do
+        read -rs "KEY_PASS?passphrase for $name: " || die "no passphrase given for $name"
+        print   # -s ate the newline
+        if ssh-keygen -y -P "$KEY_PASS" -f "$key" >/dev/null 2>&1; then return 0; fi
+        KEY_PASS=""
+        if (( i < tries )); then
+            info "that passphrase does not decrypt $name -- try again"
+        fi
+    done
+    die "wrong passphrase for $name"
+}
+
 secure_rm() {   # file -> best-effort secure delete
     if (( $+commands[shred] )); then
         shred -u "$1" 2>/dev/null || rm -f "$1"
@@ -889,9 +928,13 @@ export_one() {
 
     [[ -f $key ]] || die "no private key on disk for '$name' (already exported?)"
 
+    # Asked for up front, so that a key whose passphrase nobody can produce is
+    # refused outright rather than half-written into the database.
+    key_passphrase "$key"
+
     if [[ ! -f $pub ]]; then
         pubtmp=$(mktemp "${TMPDIR:-/tmp}/skm.XXXXXX")
-        ssh-keygen -y -f "$key" > "$pubtmp"
+        ssh-keygen -y -P "$KEY_PASS" -f "$key" > "$pubtmp"
         pub=$pubtmp
     fi
 
@@ -899,10 +942,17 @@ export_one() {
     # lookup, so only a genuinely new entry costs an `add`. Asking `add`
     # itself would answer nothing: it reports a duplicate and an unwritable
     # database with the same "could not create entry".
+    #
+    # Either way -p writes the key's passphrase into the entry's Password
+    # field, which is where KeePassXC looks when it loads the key on unlock.
+    # A key with no passphrase empties the field for the same reason: what is
+    # left over from a previous key is not the answer for this one.
     if (( exists )); then
         info "entry '$entry' exists, updating attachments"
+        run_kp_entry_pw "$KEY_PASS" edit -p "$db" "$entry" \
+            || kp_die "could not set the password of '$entry'"
     else
-        run_kp add "$db" "$entry" --url "ssh://$name" \
+        run_kp_entry_pw "$KEY_PASS" add -p "$db" "$entry" --url "ssh://$name" \
             || kp_die "could not create entry '$entry'"
     fi
 
@@ -921,7 +971,12 @@ export_one() {
         || kp_die "could not store 'KeeAgent.settings' in '$entry'"
     rm -f "$tmp" "$pubtmp"
 
-    info "exported $name -> $entry (private + public key)"
+    if [[ -n $KEY_PASS ]]; then
+        info "exported $name -> $entry (private + public key, passphrase in Password)"
+    else
+        info "exported $name -> $entry (private + public key)"
+    fi
+    KEY_PASS=""
 }
 
 cmd_export() {
@@ -986,7 +1041,7 @@ cmd_export() {
 
     print
     info "next: in KeePassXC, enable Tools > Settings > SSH Agent, then re-unlock the database."
-    info "the entry's Password field must hold the key's passphrase, or it can't decrypt it."
+    info "each entry's Password field holds that key's passphrase, which is what decrypts it."
     info "verify with 'ssh-add -l', then run 'skm agent <name>' and delete the on-disk key."
 }
 

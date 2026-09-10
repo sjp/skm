@@ -126,6 +126,64 @@ teardown() { skm_teardown; }
     }
 }
 
+@test "export stores the key's passphrase in the entry" {
+    add_host box
+    encrypt_key box 'sekrit pass'
+
+    run skm_answer "$DB_PW" 'sekrit pass' -- export box "$DB"
+    assert_ok
+
+    # Without it in the Password field the agent has an undecryptable key.
+    assert_equal "$(vault_password "SSH Keys/box")" 'sekrit pass'
+}
+
+@test "export refuses a passphrase that does not open the key" {
+    add_host box
+    encrypt_key box 'sekrit pass'
+
+    run skm_answer "$DB_PW" 'not the passphrase' -- export box "$DB"
+    assert_fails
+    assert_output_has "passphrase"
+
+    # nothing was stored, so there is no entry claiming to hold the key
+    run vault_attachments "SSH Keys/box"
+    assert_output_lacks "id_ed25519_box"
+}
+
+@test "export asks for no passphrase when the key has none" {
+    add_host box
+
+    run skm_answer "$DB_PW" -- export box "$DB"
+    assert_ok
+    assert_equal "$(vault_password "SSH Keys/box")" ""
+}
+
+@test "export --force replaces the password of the key it replaces" {
+    add_host box
+    encrypt_key box 'sekrit pass'
+    skm_answer "$DB_PW" 'sekrit pass' -- export box "$DB" >/dev/null
+
+    # a replacement key with no passphrase: the old one must not be left behind
+    rm -f "$(keyfile box)" "$(keyfile box).pub"
+    ssh-keygen -q -t ed25519 -N '' -f "$(keyfile box)" -C replacement
+
+    run skm_answer "$DB_PW" -- export --force box "$DB"
+    assert_ok
+    assert_equal "$(vault_password "SSH Keys/box")" ""
+}
+
+@test "export regenerates a missing public half of a passphrased key" {
+    add_host box
+    encrypt_key box 'sekrit pass'
+    rm -f "$(keyfile box).pub"
+
+    run skm_answer "$DB_PW" 'sekrit pass' -- export box "$DB"
+    assert_ok
+
+    run vault_attachments "SSH Keys/box"
+    assert_output_has "id_ed25519_box.pub"
+}
+
 @test "export rejects an unknown flag" {
     add_host box
     run skm_answer "$DB_PW" -- export --wat box "$DB"
