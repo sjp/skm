@@ -35,7 +35,10 @@
 emulate -L zsh
 setopt err_exit no_unset pipe_fail
 
-SSH_DIR="${SSH_DIR:-$HOME/.ssh}"
+# The directory skm manages. SKM_SSH_DIR moves it somewhere else; the older,
+# more collision-prone SSH_DIR is still honoured so existing setups keep
+# working.
+SSH_DIR="${SKM_SSH_DIR:-${SSH_DIR:-$HOME/.ssh}}"
 CONF_DIR="$SSH_DIR/config.d"
 CONFIG="$SSH_DIR/config"
 SOCK_DIR="$SSH_DIR/agents"
@@ -53,6 +56,45 @@ info() { print "  $*" }
 
 # ---------------------------------------------------------------- bootstrap
 
+# ssh resolves a relative Include path against ~/.ssh rather than against the
+# directory the config file lives in, so only the default layout can use the
+# short relative form; anywhere else has to be spelled out in full. The quotes
+# hold a path containing spaces together as one argument.
+include_arg() {
+    if [[ $SSH_DIR == "$HOME/.ssh" ]]; then
+        print -r -- 'config.d/*.conf'
+    else
+        print -r -- "\"$CONF_DIR/*.conf\""
+    fi
+}
+
+# Whether $CONFIG already pulls in the fragment directory, written as the bare
+# relative glob, as '~/.ssh/...', or as a full path, quoted or not.
+include_present() {
+    local rel="" tilde=""
+    if [[ $SSH_DIR == "$HOME/.ssh" ]]; then
+        rel='config.d/*.conf'
+        # A literal string to compare against, not a path to resolve: this is
+        # simply how a hand-written ssh config usually spells the same glob.
+        tilde='~/.ssh/config.d/*.conf'
+    fi
+    awk -v abs="$CONF_DIR/*.conf" -v rel="$rel" -v tilde="$tilde" '
+        {
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            if (line !~ /^Include[ \t]/) next
+            sub(/^Include[ \t]+/, "", line)
+            sub(/[ \t]+$/, "", line)
+            if (line ~ /^".*"$/) line = substr(line, 2, length(line) - 2)
+            if (line == abs || (rel != "" && (line == rel || line == tilde))) {
+                found = 1
+                exit
+            }
+        }
+        END { exit found ? 0 : 1 }
+    ' "$CONFIG"
+}
+
 ensure_include() {
     mkdir -p "$CONF_DIR"
     chmod 700 "$SSH_DIR" "$CONF_DIR"
@@ -60,13 +102,14 @@ ensure_include() {
 
     # Include must sit at the very top: ssh_config is first-match-wins, so a
     # later Include would be shadowed by any earlier catch-all Host block.
-    if ! grep -qE '^[[:space:]]*Include[[:space:]]+config\.d/' "$CONFIG"; then
-        print -r -- "Include config.d/*.conf" > "$CONFIG.tmp"
+    if ! include_present; then
+        local arg=$(include_arg)
+        print -r -- "Include $arg" > "$CONFIG.tmp"
         print >> "$CONFIG.tmp"
         cat "$CONFIG" >> "$CONFIG.tmp"
         mv "$CONFIG.tmp" "$CONFIG"
         chmod 600 "$CONFIG"
-        info "added 'Include config.d/*.conf' to $CONFIG"
+        info "added 'Include $arg' to $CONFIG"
     fi
 }
 
@@ -178,7 +221,10 @@ Host $name
     # calls ride the existing master and never re-ask the agent — so a locked
     # KeePassXC vault doesn't interrupt an active session.
     ControlMaster auto
-    ControlPath ~/.ssh/cm/%r@%h:%p
+    # %C is a fixed-length hash of the connection, so the socket path stays
+    # well inside the ~104-byte limit however long the user and host names
+    # get, and a directory listing of cm/ gives away neither.
+    ControlPath "$SSH_DIR/cm/%C"
     ControlPersist 10m
 EOF
     chmod 600 "$conf"

@@ -94,6 +94,11 @@ identity_file() {
 
 host_line() { awk '$1=="Host"{sub(/^[ \t]*Host[ \t]+/,""); print; exit}' "$(conffile "$1")"; }
 
+control_path() {
+    awk '$1=="ControlPath"{ sub(/^[ \t]*ControlPath[ \t]+/,""); gsub(/^"|"$/,""); print; exit }' \
+        "$(conffile "$1")"
+}
+
 file_mode() {
     case $(uname) in
         Darwin) stat -f '%Lp' "$1" ;;

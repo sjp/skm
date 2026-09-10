@@ -142,6 +142,69 @@ teardown() { skm_teardown; }
     assert_equal "$output" 1
 }
 
+@test "a managed directory outside ~/.ssh is included by its full path" {
+    export SSH_DIR="$SKM_TMP/elsewhere"
+    mkdir -p "$SSH_DIR"
+    add_host box
+
+    run head -1 "$SSH_DIR/config"
+    assert_output_has "Include \"$SSH_DIR/config.d/*.conf\""
+
+    # ssh resolves a relative Include against ~/.ssh whatever directory the
+    # config itself sits in, so only the full path reaches the fragments.
+    run ssh -F "$SSH_DIR/config" -G box
+    assert_ok
+    assert_output_has "hostname example.com"
+    assert_output_has "identityfile $(keyfile box)"
+}
+
+@test "a second add to a relocated directory does not repeat the Include" {
+    export SSH_DIR="$SKM_TMP/elsewhere"
+    mkdir -p "$SSH_DIR"
+    add_host box
+    add_host tin
+
+    run grep -c Include "$SSH_DIR/config"
+    assert_equal "$output" 1
+}
+
+@test "SKM_SSH_DIR wins over SSH_DIR" {
+    export SKM_SSH_DIR="$SKM_TMP/namespaced"
+    mkdir -p "$SKM_SSH_DIR"
+    add_host box
+
+    assert_file "$SKM_SSH_DIR/id_ed25519_box"
+    assert_file "$SKM_SSH_DIR/config.d/box.conf"
+    assert_no_file "$(conffile box)"
+}
+
+# ---------------------------------------------------------- multiplexing
+
+@test "the multiplexing socket lives in the managed directory, named by hash" {
+    add_host box
+    assert_equal "$(control_path box)" "$SSH_DIR/cm/%C"
+    assert_mode "$SSH_DIR/cm" 700
+}
+
+@test "a long user and host name still give a short, opaque socket path" {
+    add_host long deploy@app-01.prod.eu-west-1.internal.example.com
+
+    run ssh -F "$(conffile long)" -G long
+    assert_ok
+    local sock
+    sock=$(printf '%s\n' "$output" | sed -n 's/^controlpath //p')
+
+    # A Unix socket path is capped at ~104 bytes, and a name built from
+    # user@host both grows with them and advertises the target to anyone
+    # who can list the directory.
+    assert_equal "${sock%/*}" "$SSH_DIR/cm"
+    [ "${#sock}" -lt 104 ] || { printf 'socket path too long: %s\n' "$sock" >&2; return 1; }
+    case $sock in
+        *deploy*|*example.com*)
+            printf 'socket name names the target: %s\n' "$sock" >&2; return 1 ;;
+    esac
+}
+
 # ----------------------------------------------------------------- alias
 
 @test "alias appends patterns to the Host line and leaves HostName alone" {
