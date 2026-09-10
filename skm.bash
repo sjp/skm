@@ -387,6 +387,13 @@ cmd_list() {
 status_verdict() {
     local mode=$1 priv_disk=$2 priv_vault=$3 fp_status=$4 agent_state=$5
 
+    # A vault that could not be read says nothing about the key. Anything
+    # firmer would invite a decision the reading does not support.
+    if [[ $priv_vault == error ]]; then
+        printf 'UNKNOWN: the vault could not be read'
+        return
+    fi
+
     if [[ $fp_status == MISMATCH ]]; then
         printf 'DANGER: vault copy is a different key from the on-disk copy'
         return
@@ -469,24 +476,29 @@ status_one() {
     local local_fp=""
     [[ $priv_disk == yes ]] && local_fp=$(key_fingerprint "$key")
 
-    local priv_vault="?" pub_vault="?" vault_fp="" fp_status="n/a (no db)"
+    local priv_vault="?" pub_vault="?" vault_fp="" fp_status="n/a (no db)" vault_err=""
     if [[ -n $db ]]; then
         local entry="$KP_GROUP/$name" base; base=$(basename "$key")
         local tmpdir; tmpdir=$(ramtemp)
-        if kp_attachment_export "$db" "$entry" "$base" "$tmpdir/$base"; then
-            priv_vault="yes"
-            vault_fp=$(key_fingerprint "$tmpdir/$base")
-        else
-            priv_vault="no"
-        fi
-        if kp_attachment_export "$db" "$entry" "$base.pub" "$tmpdir/$base.pub"; then
-            pub_vault="yes"
-        else
-            pub_vault="no"
-        fi
+        local rc=0
+        kp_attachment_export "$db" "$entry" "$base" "$tmpdir/$base" || rc=$?
+        case $rc in
+            0) priv_vault="yes"; vault_fp=$(key_fingerprint "$tmpdir/$base") ;;
+            1) priv_vault="no" ;;
+            *) priv_vault="error"; vault_err=$KP_ERR ;;
+        esac
+        rc=0
+        kp_attachment_export "$db" "$entry" "$base.pub" "$tmpdir/$base.pub" || rc=$?
+        case $rc in
+            0) pub_vault="yes" ;;
+            1) pub_vault="no" ;;
+            *) pub_vault="error"; vault_err=$KP_ERR ;;
+        esac
         rm -rf "$tmpdir"
 
-        if [[ -n $local_fp && -n $vault_fp ]]; then
+        if [[ $priv_vault == error ]]; then
+            fp_status="n/a (vault could not be read)"
+        elif [[ -n $local_fp && -n $vault_fp ]]; then
             [[ $local_fp == "$vault_fp" ]] && fp_status="match" || fp_status="MISMATCH"
         elif [[ -n $local_fp || -n $vault_fp ]]; then
             fp_status="n/a (only one copy present)"
@@ -514,6 +526,7 @@ status_one() {
     printf '  %-13s %s%s\n' "IdentityFile" "$(basename "$id")" "$([[ $mode == agent ]] && printf '   (agent)')"
     printf '  %-13s disk: %-4s vault: %s\n' "private" "$priv_disk" "$priv_vault"
     printf '  %-13s disk: %-4s vault: %s\n' "public"  "$pub_disk"  "$pub_vault"
+    [[ -n $vault_err ]] && printf '  %-13s %s\n' "vault error" "$vault_err"
     [[ -n $db ]] && printf '  %-13s %s\n' "fingerprint" "$fp_status"
     printf '  %-13s %s\n' "agent"  "$agent_state"
     printf '  %-13s %s\n' "status" "$verdict"
@@ -548,7 +561,7 @@ cmd_status() {
 
     if [[ -n $db ]]; then
         kp_require
-        kp_password
+        kp_password "$db"
     fi
 
     local n
@@ -615,6 +628,10 @@ cmd_ondisk() {
 KP_CLI=""
 KP_PW=""
 
+# What keepassxc-cli last wrote to stderr. Kept so a caller can tell "the
+# database says no" from "the database never answered the question".
+KP_ERR=""
+
 # On macOS, keepassxc-cli ships inside the app bundle and isn't on PATH unless
 # you installed via Homebrew. Find it either way. A failed lookup is reported
 # by the exit status and nothing else: this runs inside $( ), where an `exit`
@@ -664,24 +681,73 @@ keeagent_xml() {
 EOF
 }
 
-# Ask for the database password once; every vault call in the run reuses it.
-kp_password() {
-    read -rsp "KeePassXC database password: " KP_PW || die "no password given"
-    echo   # -s ate the newline
-}
-
 # keepassxc-cli reads the database password from stdin, so we hand it the same
-# password for each subcommand rather than prompting five times.
-run_kp() { printf '%s\n' "$KP_PW" | "$KP_CLI" "$@" >/dev/null; }
-
-kp_entry_exists() {   # db entry  ->  0 if the entry is present
-    run_kp show "$1" "$2" 2>/dev/null
+# password for each subcommand rather than prompting five times. Its stderr is
+# kept rather than discarded, because "not in the database" and "could not open
+# the database" are the same exit status and only the text tells them apart.
+# The unlock prompt it writes there even when the password arrives on stdin is
+# not a diagnostic, so it is dropped.
+run_kp() {
+    local rc=0 err=""
+    err=$(printf '%s\n' "$KP_PW" | "$KP_CLI" "$@" 2>&1 >/dev/null) || rc=$?
+    KP_ERR=$(printf '%s\n' "$err" | sed -e 's/^Enter password to unlock .*: //' -e '/^$/d')
+    return "$rc"
 }
 
-# Copy one attachment out to a file. Quiet on failure: callers read the exit
-# status to learn whether the vault holds that half of the key at all.
-kp_attachment_export() {   # db entry attachment dest  ->  0 if it was written
-    run_kp attachment-export "$1" "$2" "$3" "$4" 2>/dev/null
+# Stop, quoting keepassxc rather than guessing. Guessing is how an unreadable
+# database gets reported as a key that was never stored.
+kp_die() {   # context
+    die "$1${KP_ERR:+: $KP_ERR}"
+}
+
+# Whether the last failure means the thing asked for simply isn't in there.
+# Anything else -- a wrong password, an unreadable file, a database that isn't
+# one -- leaves the question unanswered and must never read as absence.
+kp_absent() {
+    [[ $KP_ERR == *'Could not find'* ]]
+}
+
+# Ask for the database password and prove it opens the database before any
+# command acts on what the database appears to say. An unchecked password is
+# indistinguishable from an empty vault, and an empty vault is what makes
+# `drop` offer to delete the last copy of a key.
+kp_password() {   # db
+    local db=$1 tries=1 i
+    [[ -t 0 ]] && tries=3   # answers arriving down a pipe get a single attempt
+
+    for (( i = 1; i <= tries; i++ )); do
+        read -rsp "KeePassXC database password: " KP_PW || die "no password given"
+        echo   # -s ate the newline
+        if run_kp db-info "$db"; then
+            return 0
+        fi
+        KP_PW=""
+        if [[ $KP_ERR == *'Invalid credentials'* ]]; then
+            if ((i < tries)); then
+                info "wrong password for $db -- try again"
+                continue
+            fi
+            die "wrong password for $db"
+        fi
+        kp_die "could not open $db"
+    done
+}
+
+# The two lookups below answer in three ways, not two:
+#   0  the database has it
+#   1  the database doesn't have it
+#   2  the database could not be read; KP_ERR says why
+# Callers must keep 1 and 2 apart: only 1 means the key really isn't stored.
+kp_entry_exists() {   # db entry
+    if run_kp show "$1" "$2"; then return 0; fi
+    if kp_absent; then return 1; fi
+    return 2
+}
+
+kp_attachment_export() {   # db entry attachment dest
+    if run_kp attachment-export "$1" "$2" "$3" "$4"; then return 0; fi
+    if kp_absent; then return 1; fi
+    return 2
 }
 
 # SHA256 fingerprint only (no comment/bit-count noise), so a match is a real
@@ -727,24 +793,40 @@ export_one() {
         pub=$pubtmp
     fi
 
-    run_kp mkdir  "$db" "$KP_GROUP" 2>/dev/null || true
-    run_kp add    "$db" "$entry" --url "ssh://$name" 2>/dev/null || \
+    # The group is shared by every exported key, so from the second export on
+    # "already exists" is the expected answer and the only tolerable failure.
+    run_kp mkdir "$db" "$KP_GROUP" || [[ $KP_ERR == *'already exists'* ]] \
+        || kp_die "could not create group '$KP_GROUP' in $db"
+
+    # Say the entry is already there only once that has actually been looked
+    # up: a failing `add` on its own is just as likely to mean the database
+    # could not be written at all.
+    if ! run_kp add "$db" "$entry" --url "ssh://$name"; then
+        local rc=0
+        kp_entry_exists "$db" "$entry" || rc=$?
+        ((rc == 0)) || kp_die "could not create entry '$entry'"
         info "entry '$entry' exists, updating attachments"
+    fi
 
     # attachment-import refuses to clobber an attachment that's already there,
     # so on --force strip the old ones first (no-op if this is a fresh entry).
     if ((force)); then
-        run_kp attachment-rm "$db" "$entry" "$base"             2>/dev/null || true
-        run_kp attachment-rm "$db" "$entry" "$base.pub"         2>/dev/null || true
-        run_kp attachment-rm "$db" "$entry" "KeeAgent.settings" 2>/dev/null || true
+        local a
+        for a in "$base" "$base.pub" KeeAgent.settings; do
+            run_kp attachment-rm "$db" "$entry" "$a" || kp_absent \
+                || kp_die "could not remove attachment '$a' from '$entry'"
+        done
     fi
 
     local tmp; tmp=$(mktemp "${TMPDIR:-/tmp}/skm.XXXXXX")   # BSD mktemp needs a template
     keeagent_xml "$base" > "$tmp"
 
-    run_kp attachment-import "$db" "$entry" "$base"            "$key"
-    run_kp attachment-import "$db" "$entry" "$base.pub"        "$pub"
-    run_kp attachment-import "$db" "$entry" "KeeAgent.settings" "$tmp"
+    run_kp attachment-import "$db" "$entry" "$base"             "$key" \
+        || kp_die "could not store '$base' in '$entry'"
+    run_kp attachment-import "$db" "$entry" "$base.pub"         "$pub" \
+        || kp_die "could not store '$base.pub' in '$entry'"
+    run_kp attachment-import "$db" "$entry" "KeeAgent.settings" "$tmp" \
+        || kp_die "could not store 'KeeAgent.settings' in '$entry'"
     rm -f "$tmp" "$pubtmp"
 
     info "exported $name -> $entry (private + public key)"
@@ -774,12 +856,18 @@ cmd_export() {
     fi
 
     kp_require
-    kp_password
+    kp_password "$db"
 
     if ((! force)); then
-        local n existing=()
+        local n rc existing=()
         for n in "${names[@]}"; do
-            kp_entry_exists "$db" "$KP_GROUP/$n" && existing+=("$n")
+            rc=0
+            kp_entry_exists "$db" "$KP_GROUP/$n" || rc=$?
+            case $rc in
+                0) existing+=("$n") ;;
+                1) ;;
+                *) kp_die "could not read $db" ;;
+            esac
         done
         [[ ${#existing[@]} -eq 0 ]] || \
             die "already in KeePassXC: ${existing[*]}  (re-run with --force to overwrite)"
@@ -817,16 +905,19 @@ cmd_drop() {
     local entry="$KP_GROUP/$name" base; base=$(basename "$key")
 
     kp_require
-    kp_password
+    kp_password "$db"
 
     local have; have=$(key_fingerprint "$key")
     [[ -n $have ]] || die "could not read local key: $key"
 
     local tmpdir; tmpdir=$(ramtemp)
-    local vault_key="$tmpdir/$base" vault_fp=""
-    if kp_attachment_export "$db" "$entry" "$base" "$vault_key"; then
-        vault_fp=$(key_fingerprint "$vault_key")
-    fi
+    local vault_key="$tmpdir/$base" vault_fp="" rc=0
+    kp_attachment_export "$db" "$entry" "$base" "$vault_key" || rc=$?
+    case $rc in
+        0) vault_fp=$(key_fingerprint "$vault_key") ;;
+        1) ;;   # the key really isn't stored under this entry
+        *) rm -rf "$tmpdir"; kp_die "could not read $db" ;;
+    esac
     rm -rf "$tmpdir"
 
     echo
@@ -880,17 +971,27 @@ cmd_restore() {
     local entry="$KP_GROUP/$name" base; base=$(basename "$key")
 
     kp_require
-    kp_password
+    kp_password "$db"
 
-    kp_attachment_export "$db" "$entry" "$base" "$key" \
-        || die "no key attachment for '$name' in $entry"
+    local rc=0
+    kp_attachment_export "$db" "$entry" "$base" "$key" || rc=$?
+    case $rc in
+        0) ;;
+        1) die "no key attachment for '$name' in $entry" ;;
+        *) kp_die "could not read $db" ;;
+    esac
     chmod 600 "$key"
 
-    if ! kp_attachment_export "$db" "$entry" "$base.pub" "$key.pub" \
-            && [[ ! -f $key.pub ]]; then
-        info "no public key attachment in $entry; regenerating from the private key"
-        ssh-keygen -y -f "$key" > "$key.pub"
-    fi
+    rc=0
+    kp_attachment_export "$db" "$entry" "$base.pub" "$key.pub" || rc=$?
+    case $rc in
+        0) ;;
+        1) if [[ ! -f $key.pub ]]; then
+               info "no public key attachment in $entry; regenerating from the private key"
+               ssh-keygen -y -f "$key" > "$key.pub"
+           fi ;;
+        *) kp_die "could not read $db" ;;
+    esac
 
     retarget "$name" ondisk
 

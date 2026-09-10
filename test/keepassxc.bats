@@ -308,3 +308,76 @@ teardown() { skm_teardown; }
     assert_output_has "no such database"
     assert_no_file "$(conffile box)"
 }
+
+# --------------------------------------------------- wrong vault password
+#
+# A password that doesn't open the database must never be reported as a
+# database that doesn't hold the key: that reading is what talks a user into
+# deleting their only copy.
+
+@test "a wrong password stops status instead of reporting the key missing" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+
+    run skm_answer "not the password" -- status box "$DB"
+    assert_fails
+    assert_output_has "wrong password"
+    assert_output_lacks "vault: no"
+    assert_output_lacks "LOST"
+}
+
+@test "a wrong password stops drop before it can call the key lost" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+
+    run skm_answer "not the password" y -- drop box "$DB"
+    assert_fails
+    assert_output_has "wrong password"
+    assert_output_lacks "DANGER"
+    assert_file "$(keyfile box)"
+}
+
+@test "a wrong password stops drop --force with the key still on disk" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+
+    run skm_answer "not the password" y -- drop --force box "$DB"
+    assert_fails
+    assert_output_has "wrong password"
+    assert_output_lacks "loses the only copy"
+    assert_file "$(keyfile box)"
+}
+
+@test "a wrong password stops export instead of half-writing an entry" {
+    add_host box
+
+    run skm_answer "not the password" -- export box "$DB"
+    assert_fails
+    assert_output_has "wrong password"
+    assert_output_lacks "updating attachments"
+
+    run vault_attachments "SSH Keys/box"
+    assert_output_lacks "id_ed25519_box"
+}
+
+@test "a wrong password stops restore instead of blaming the entry" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    skm_answer "$DB_PW" y -- drop box "$DB" >/dev/null
+
+    run skm_answer "not the password" -- restore box "$DB"
+    assert_fails
+    assert_output_has "wrong password"
+    assert_output_lacks "no key attachment"
+    assert_no_file "$(keyfile box)"
+}
+
+@test "a database that is not a database is reported as such" {
+    add_host box
+    head -c 512 /dev/urandom > "$SKM_TMP/junk.kdbx"
+
+    run skm_answer "$DB_PW" -- status box "$SKM_TMP/junk.kdbx"
+    assert_fails
+    assert_output_has "could not open"
+    assert_output_lacks "vault: no"
+}
