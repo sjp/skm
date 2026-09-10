@@ -451,7 +451,7 @@ include_report() {
 }
 
 status_one() {
-    local name=$1 db=$2 pw=$3 kpcli=$4
+    local name=$1 db=$2
     local conf; conf=$(conffile "$name")
     local key; key=$(keyfile "$name")
     local pub="$key.pub"
@@ -473,15 +473,13 @@ status_one() {
     if [[ -n $db ]]; then
         local entry="$KP_GROUP/$name" base; base=$(basename "$key")
         local tmpdir; tmpdir=$(ramtemp)
-        if printf '%s\n' "$pw" | "$kpcli" attachment-export "$db" "$entry" "$base" \
-                "$tmpdir/$base" 2>/dev/null; then
+        if kp_attachment_export "$db" "$entry" "$base" "$tmpdir/$base"; then
             priv_vault="yes"
             vault_fp=$(key_fingerprint "$tmpdir/$base")
         else
             priv_vault="no"
         fi
-        if printf '%s\n' "$pw" | "$kpcli" attachment-export "$db" "$entry" "$base.pub" \
-                "$tmpdir/$base.pub" 2>/dev/null; then
+        if kp_attachment_export "$db" "$entry" "$base.pub" "$tmpdir/$base.pub"; then
             pub_vault="yes"
         else
             pub_vault="no"
@@ -548,15 +546,13 @@ cmd_status() {
 
     include_report
 
-    local pw="" kpcli=""
     if [[ -n $db ]]; then
-        kpcli=$(kp_bin)
-        read -rsp "KeePassXC database password: " pw || die "no password given"
-        echo   # -s ate the newline
+        kp_require
+        kp_password
     fi
 
     local n
-    for n in "${names[@]}"; do status_one "$n" "$db" "$pw" "$kpcli"; done
+    for n in "${names[@]}"; do status_one "$n" "$db"; done
 }
 
 cmd_show() {
@@ -614,15 +610,33 @@ cmd_ondisk() {
 
 # ---------------------------------------------------------------- keepassxc
 
+# The binary and the database password, settled once per run and shared by
+# every vault call below. Commands that never open a vault leave both empty.
+KP_CLI=""
+KP_PW=""
+
 # On macOS, keepassxc-cli ships inside the app bundle and isn't on PATH unless
-# you installed via Homebrew. Find it either way.
-kp_bin() {
+# you installed via Homebrew. Find it either way. A failed lookup is reported
+# by the exit status and nothing else: this runs inside $( ), where an `exit`
+# would end the substitution alone and leave the caller running on an empty
+# path.
+kp_lookup() {
     if command -v keepassxc-cli >/dev/null 2>&1; then
         command -v keepassxc-cli
     elif [[ -x /Applications/KeePassXC.app/Contents/MacOS/keepassxc-cli ]]; then
         printf '%s\n' /Applications/KeePassXC.app/Contents/MacOS/keepassxc-cli
     else
-        die "keepassxc-cli not found (macOS: it lives in KeePassXC.app/Contents/MacOS)"
+        return 1
+    fi
+}
+
+# Settle on the binary before a vault operation starts, so a missing one stops
+# the run there instead of turning into a string of unexplained failures --
+# and, worse, an empty vault reading that looks like "the key isn't in there".
+kp_require() {
+    if [[ -z $KP_CLI ]]; then
+        KP_CLI=$(kp_lookup) \
+            || die "keepassxc-cli not found (macOS: it lives in KeePassXC.app/Contents/MacOS)"
     fi
 }
 
@@ -650,8 +664,24 @@ keeagent_xml() {
 EOF
 }
 
-kp_entry_exists() {   # db entry pw kpcli  ->  0 if the entry is present
-    printf '%s\n' "$3" | "$4" show "$1" "$2" >/dev/null 2>&1
+# Ask for the database password once; every vault call in the run reuses it.
+kp_password() {
+    read -rsp "KeePassXC database password: " KP_PW || die "no password given"
+    echo   # -s ate the newline
+}
+
+# keepassxc-cli reads the database password from stdin, so we hand it the same
+# password for each subcommand rather than prompting five times.
+run_kp() { printf '%s\n' "$KP_PW" | "$KP_CLI" "$@" >/dev/null; }
+
+kp_entry_exists() {   # db entry  ->  0 if the entry is present
+    run_kp show "$1" "$2" 2>/dev/null
+}
+
+# Copy one attachment out to a file. Quiet on failure: callers read the exit
+# status to learn whether the vault holds that half of the key at all.
+kp_attachment_export() {   # db entry attachment dest  ->  0 if it was written
+    run_kp attachment-export "$1" "$2" "$3" "$4" 2>/dev/null
 }
 
 # SHA256 fingerprint only (no comment/bit-count noise), so a match is a real
@@ -682,7 +712,7 @@ ramtemp() {   # -> path to a fresh 0700 dir, RAM-backed if the platform has one
 }
 
 export_one() {
-    local name=$1 db=$2 pw=$3 kpcli=$4 force=${5:-0}
+    local name=$1 db=$2 force=${3:-0}
     local key; key=$(keyfile "$name")
     local entry="$KP_GROUP/$name"
     local base; base=$(basename "$key")
@@ -696,10 +726,6 @@ export_one() {
         ssh-keygen -y -f "$key" > "$pubtmp"
         pub=$pubtmp
     fi
-
-    # keepassxc-cli reads the database password from stdin, so we hand it the
-    # same password for each subcommand rather than prompting five times.
-    run_kp() { printf '%s\n' "$pw" | "$kpcli" "$@" >/dev/null; }
 
     run_kp mkdir  "$db" "$KP_GROUP" 2>/dev/null || true
     run_kp add    "$db" "$entry" --url "ssh://$name" 2>/dev/null || \
@@ -725,8 +751,6 @@ export_one() {
 }
 
 cmd_export() {
-    local kpcli; kpcli=$(kp_bin)
-
     local force=0 args=()
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -749,21 +773,21 @@ cmd_export() {
         require_host "$what"; names=("$what")
     fi
 
-    local pw=""
-    read -rsp "KeePassXC database password: " pw || die "no password given"
-    echo   # -s ate the newline
+    kp_require
+    kp_password
 
     if ((! force)); then
         local n existing=()
         for n in "${names[@]}"; do
-            kp_entry_exists "$db" "$KP_GROUP/$n" "$pw" "$kpcli" && existing+=("$n")
+            kp_entry_exists "$db" "$KP_GROUP/$n" && existing+=("$n")
         done
         [[ ${#existing[@]} -eq 0 ]] || \
             die "already in KeePassXC: ${existing[*]}  (re-run with --force to overwrite)"
     fi
 
     local n
-    for n in "${names[@]}"; do export_one "$n" "$db" "$pw" "$kpcli" "$force"; done
+    for n in "${names[@]}"; do export_one "$n" "$db" "$force"; done
+    KP_PW=""
 
     echo
     info "next: in KeePassXC, enable Tools > Settings > SSH Agent, then re-unlock the database."
@@ -774,8 +798,6 @@ cmd_export() {
 # Delete the on-disk private key so it lives only in KeePassXC. Deliberately
 # single-key (no --all): this is meant to require real consideration each time.
 cmd_drop() {
-    local kpcli; kpcli=$(kp_bin)
-
     local force=0 args=()
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -794,17 +816,15 @@ cmd_drop() {
 
     local entry="$KP_GROUP/$name" base; base=$(basename "$key")
 
-    local pw=""
-    read -rsp "KeePassXC database password: " pw || die "no password given"
-    echo   # -s ate the newline
+    kp_require
+    kp_password
 
     local have; have=$(key_fingerprint "$key")
     [[ -n $have ]] || die "could not read local key: $key"
 
     local tmpdir; tmpdir=$(ramtemp)
     local vault_key="$tmpdir/$base" vault_fp=""
-    if printf '%s\n' "$pw" | "$kpcli" attachment-export "$db" "$entry" "$base" "$vault_key" \
-            2>/dev/null; then
+    if kp_attachment_export "$db" "$entry" "$base" "$vault_key"; then
         vault_fp=$(key_fingerprint "$vault_key")
     fi
     rm -rf "$tmpdir"
@@ -839,8 +859,6 @@ cmd_drop() {
 # Inverse of drop: pull the private key back out of KeePassXC onto disk, in
 # the layout skm expects, and flip the config back to on-disk.
 cmd_restore() {
-    local kpcli; kpcli=$(kp_bin)
-
     local force=0 args=()
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -861,16 +879,15 @@ cmd_restore() {
 
     local entry="$KP_GROUP/$name" base; base=$(basename "$key")
 
-    local pw=""
-    read -rsp "KeePassXC database password: " pw || die "no password given"
-    echo   # -s ate the newline
+    kp_require
+    kp_password
 
-    printf '%s\n' "$pw" | "$kpcli" attachment-export "$db" "$entry" "$base" "$key" 2>/dev/null \
+    kp_attachment_export "$db" "$entry" "$base" "$key" \
         || die "no key attachment for '$name' in $entry"
     chmod 600 "$key"
 
-    if ! printf '%s\n' "$pw" | "$kpcli" attachment-export "$db" "$entry" "$base.pub" \
-            "$key.pub" 2>/dev/null && [[ ! -f $key.pub ]]; then
+    if ! kp_attachment_export "$db" "$entry" "$base.pub" "$key.pub" \
+            && [[ ! -f $key.pub ]]; then
         info "no public key attachment in $entry; regenerating from the private key"
         ssh-keygen -y -f "$key" > "$key.pub"
     fi
@@ -926,7 +943,7 @@ cmd_scope() {
     ((confirm))    && flags+=(-c)
     [[ -n $ttl ]]  && flags+=(-t "$ttl")
 
-    local n key tmp base_dir kpcli
+    local n key tmp base_dir
     for n in "${names[@]}"; do
         require_host "$n"
         key=$(keyfile "$n")
@@ -938,14 +955,14 @@ cmd_scope() {
             # /dev/shm is RAM-backed so it never hits disk — but it's a Linux
             # thing. macOS has no equivalent, so the copy is briefly on disk
             # there; we unlink it immediately after ssh-add.
-            kpcli=$(kp_bin)
+            kp_require
             if   [[ -d ${XDG_RUNTIME_DIR:-} ]]; then base_dir=$XDG_RUNTIME_DIR
             elif [[ -d /dev/shm ]];             then base_dir=/dev/shm
             else                                     base_dir=${TMPDIR:-/tmp}
             fi
             tmp=$(mktemp -d "$base_dir/skm.XXXXXX")
             chmod 700 "$tmp"
-            "$kpcli" attachment-export "$db" "$KP_GROUP/$n" \
+            "$KP_CLI" attachment-export "$db" "$KP_GROUP/$n" \
                 "$(basename "$key")" "$tmp/$n"
             chmod 600 "$tmp/$n"
             ssh-add "${flags[@]}" "$tmp/$n"
