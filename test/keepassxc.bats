@@ -282,6 +282,10 @@ teardown() { skm_teardown; }
     assert_ok
     assert_output_has "fingerprints match"
 
+    # The deletion is not an erasure, and the report says so rather than
+    # leaving the user to assume the bytes are gone from the medium.
+    assert_output_has "full-disk encryption"
+
     assert_no_file "$(keyfile box)"
     assert_file "$(keyfile box).pub"
     assert_equal "$(identity_file box)" "$(keyfile box).pub"

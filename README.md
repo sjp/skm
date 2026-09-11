@@ -33,8 +33,8 @@ written for whatever shell you call it from.
 Needed at runtime: `ssh`, `ssh-keygen`, `ssh-add`, `ssh-agent` and — for the
 vault commands only — `keepassxc-cli`. On macOS that binary lives inside
 `/Applications/KeePassXC.app`, where skm finds it without help. `shred` is
-used when it is there and worked around when it is not, so Linux, macOS and
-the BSDs all work.
+used, where it exists, to overwrite a private key on its way off disk, and
+worked around where it does not, so Linux, macOS and the BSDs all work.
 
 ## What it puts where
 
@@ -131,9 +131,18 @@ check, say — open a database with no one at the keyboard.
   authenticate as you, without ever seeing the key itself. That is the reason
   for scopes, and the reason not to use `ForwardAgent` on a host you do not
   control.
-- **Dropping a key is not undoing it.** The private key is gone from disk once
-  `drop` finishes; the vault holds the only copy. Keep the database backed up
-  the way you would keep any other single copy of something irreplaceable.
+- **Dropping a key is not undoing it, and deleting it is best-effort.** The
+  private key is gone from disk once `drop` finishes; the vault holds the only
+  copy, so keep the database backed up the way you would keep any other single
+  copy of something irreplaceable. Gone from disk is not the same as gone from
+  the medium, though: skm overwrites the file before unlinking it, which
+  destroys the contents only on a filesystem that writes in place. An SSD's wear
+  levelling, a copy-on-write filesystem such as btrfs or ZFS, a snapshot, or a
+  backup of `~/.ssh` can all keep the old bytes, and on APFS the overwriting
+  delete has been a plain delete for years. What makes a recovered key file
+  worthless is a passphrase on the key — `skm export` puts it in the vault entry,
+  so using one costs you nothing at unlock time — and full-disk encryption
+  underneath the lot.
 - **The passphrase and the vault password are different things.** The
   passphrase protects the key file; the vault password protects the database
   that holds it. skm asks for each once per run and never writes either

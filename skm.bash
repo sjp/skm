@@ -1233,6 +1233,13 @@ key_passphrase() {   # key -> sets KEY_PASS
     die "wrong passphrase for $name"
 }
 
+# Overwriting a file before unlinking it destroys the contents only on a
+# filesystem that writes in place. Wear levelling on an SSD, copy-on-write on
+# btrfs or ZFS, a snapshot, a journal carrying the data, or a backup all leave
+# the old bytes somewhere this cannot reach -- and on APFS the overwriting
+# delete stopped overwriting years ago. It is still worth doing where it does
+# work, and nothing here treats it as more than that: what actually keeps a
+# recovered key file useless is a passphrase on the key and an encrypted disk.
 secure_rm() {   # file -> best-effort secure delete
     if command -v shred >/dev/null 2>&1; then
         shred -u "$1" 2>/dev/null || rm -f "$1"
@@ -1548,6 +1555,8 @@ cmd_drop() {
 
     echo
     info "'$name' now resolves its key via the ssh-agent; verify with 'ssh-add -l'"
+    info "the file was overwritten on its way out where the system can do that, which erases the contents only on a filesystem that writes in place -- an SSD, a copy-on-write filesystem, a snapshot or a backup can keep the old bytes"
+    info "what keeps a recovered copy worthless: a passphrase on the key, and full-disk encryption underneath it"
 }
 
 # Inverse of drop: pull the private key back out of KeePassXC onto disk, in
