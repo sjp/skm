@@ -354,6 +354,77 @@ Include other.d/*.conf
     assert_no_file "$(conffile box).bak"
 }
 
+# --------------------------------------------------------------- unalias
+
+@test "unalias takes a pattern back off the Host line" {
+    add_host box
+    skm alias box example.org '10.0.0.*' >/dev/null
+
+    run skm unalias box '10.0.0.*'
+    assert_ok
+    assert_equal "$(host_line box)" 'box example.org'
+    assert_mode "$(conffile box)" 600
+    run grep -c 'HostName example.com' "$(conffile box)"
+    assert_equal "$output" 1
+}
+
+@test "unalias removes several patterns at once and keeps the rest" {
+    add_host box
+    skm alias box one.example.com two.example.com three.example.com >/dev/null
+
+    run skm unalias box one.example.com three.example.com
+    assert_ok
+    assert_equal "$(host_line box)" 'box two.example.com'
+}
+
+@test "unalias reads a glob as the text it is, not as a pattern" {
+    add_host box
+    skm alias box '*.example.com' keep.example.com >/dev/null
+
+    run skm unalias box '*.example.com'
+    assert_ok
+    assert_equal "$(host_line box)" 'box keep.example.com'
+}
+
+@test "unalias refuses the name the host is managed under" {
+    add_host box
+    skm alias box example.org >/dev/null
+
+    run skm unalias box box
+    assert_fails
+    assert_output_has "managed under"
+    assert_equal "$(host_line box)" 'box example.org'
+}
+
+@test "unalias says which patterns were not aliases and leaves the line alone" {
+    add_host box
+    skm alias box example.org >/dev/null
+
+    run skm unalias box nosuch.example
+    assert_ok
+    assert_output_has "not an alias"
+    assert_equal "$(host_line box)" 'box example.org'
+}
+
+@test "unalias needs a managed host and at least one pattern" {
+    add_host box
+    run skm unalias box
+    assert_fails
+    assert_output_has "usage: skm unalias"
+
+    run skm unalias nosuch example.org
+    assert_fails
+    assert_output_has "no such managed host"
+}
+
+@test "a pattern removed by unalias can be added again" {
+    add_host box
+    skm alias box example.org >/dev/null
+    skm unalias box example.org >/dev/null
+    skm alias box example.org >/dev/null
+    assert_equal "$(host_line box)" 'box example.org'
+}
+
 # ------------------------------------------------------------ list / show
 
 @test "list shows the name, the target and the key" {
@@ -375,6 +446,18 @@ Include other.d/*.conf
     assert_output_has "user@example.com "
     assert_output_lacks "user@example.com:22"
     assert_output_has "(agent)"
+}
+
+@test "list says whether the private key is still on disk" {
+    add_host box
+    run skm list
+    assert_ok
+    assert_output_has "on disk"
+
+    rm -f "$(keyfile box)"
+    run skm list
+    assert_ok
+    assert_output_has "absent"
 }
 
 @test "show prints the public key" {
@@ -523,6 +606,20 @@ Include other.d/*.conf
     assert_output_has "no such database"
 }
 
+@test "status takes the database as a flag, whatever the file is called" {
+    add_host box
+    run skm status box -d "$SKM_TMP/vault.db"
+    assert_fails
+    assert_output_has "no such database: $SKM_TMP/vault.db"
+}
+
+@test "status rejects an unknown flag rather than reading it as a host" {
+    add_host box
+    run skm status --nope
+    assert_fails
+    assert_output_has "unknown flag"
+}
+
 # ------------------------------------------------------------------- rm
 
 @test "rm deletes the key pair and the config fragment when confirmed" {
@@ -618,6 +715,46 @@ Include other.d/*.conf
         run skm "$flag"
         assert_ok
         assert_output_has "skm add <name>"
+    done
+}
+
+@test "the summary names every command the dispatcher accepts" {
+    run skm help
+    assert_ok
+    local cmd
+    for cmd in add provision alias unalias list status show copy rm export \
+               drop restore agent ondisk scope scopes unscope; do
+        assert_output_has "skm $cmd"
+    done
+}
+
+@test "the summary is part of the program, not a range of lines in the file" {
+    # A copy with a line of commentary added at the top still prints its help:
+    # nothing counts lines to find it.
+    local copy="$SKM_TMP/skm-copy"
+    {
+        head -1 "$SKM_SCRIPT"
+        printf '# an extra line of commentary\n'
+        tail -n +2 "$SKM_SCRIPT"
+    } > "$copy"
+
+    run "$SKM_SHELL" "$copy" help
+    assert_ok
+    assert_output_has "skm add <name>"
+    assert_output_lacks "an extra line of commentary"
+}
+
+@test "the version is printed the same way however it is asked for" {
+    run skm --version
+    assert_ok
+    assert_output_has "skm "
+    local first="$output"
+
+    local flag
+    for flag in -V version; do
+        run skm "$flag"
+        assert_ok
+        assert_equal "$output" "$first"
     done
 }
 

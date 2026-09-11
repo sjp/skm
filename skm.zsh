@@ -4,34 +4,8 @@
 # Each host gets:  its own key, its own ~/.ssh/config.d/<name>.conf
 # Optionally:      the private key stored in KeePassXC and removed from disk.
 #
-#   skm add <name> <user@host> [port]   generate key + config entry
-#   skm provision <name> <user@host> [port] <db.kdbx>
-#                                      add + export + drop, in one go; re-run
-#                                      it to finish a run that stopped early
-#   skm alias <name> <pattern>...       let more names/IPs/globs use this key
-#   skm list                            show managed hosts
-#   skm status [name|--all] [db.kdbx]   show where each key's private/public half lives
-#   skm show <name>                     print the public key
-#   skm copy <name>                     ssh-copy-id the key to the server
-#   skm rm <name> [db.kdbx]             delete key + config (+ vault entry)
-#   skm export [--force] <name|--all> <db.kdbx>
-#                                      import key into KeePassXC as an agent key
-#   skm drop [--force] <name> <db.kdbx> remove local key (fingerprint-verified)
-#   skm restore [--force] <name> <db.kdbx>
-#                                      pull key from KeePassXC back to disk
-#   skm agent <name>                    point IdentityFile at the .pub (agent supplies private)
-#   skm ondisk <name>                   undo `agent`
-#   skm scope <label> [-c] [-t 8h] [-d db.kdbx] <name>...
-#                                       start an agent holding ONLY those keys
-#   skm scopes                          list scoped agents and what's in them
-#   skm unscope <label>                 kill a scoped agent
-#
-# Vault settings, taken from the environment:
-#   SKM_KEEPASS_GROUP          group the entries live in (default "SSH Keys")
-#   SKM_KEEPASS_KEYFILE        key file the database also needs to unlock
-#   SKM_KEEPASS_YUBIKEY        hardware key slot[:serial] the database needs
-#   SKM_KEEPASS_NO_PASSWORD    set for a database with no password at all
-#   SKM_KEEPASS_PASSWORD_FILE  file whose first line is the database password
+# `skm help` lists the commands and the environment settings; README.md
+# explains the model behind them.
 
 # Must be POSIX — it has to survive being run by sh/bash in order to complain
 # about being run by sh/bash.
@@ -489,10 +463,58 @@ cmd_alias() {
     info "Host $existing ${add[*]}"
 }
 
+# The inverse of `alias`. The first pattern on the `Host` line is the name the
+# host is managed under -- its config fragment, its key and its vault entry are
+# all named after it -- so that one stays; every pattern after it can go.
+cmd_unalias() {
+    local name=${1:-}
+    (( $# > 1 )) || die "usage: skm unalias <name> <pattern> [pattern...]"
+    shift
+    require_host "$name"
+
+    local conf=$(conffile "$name")
+    local existing=$(awk '$1=="Host"{sub(/^[ \t]*Host[ \t]+/,""); print; exit}' "$conf")
+    # ${=x} splits on whitespace, which is exactly what the Host line is: a
+    # list of patterns, none of which can contain a space.
+    local -a patterns=(${=existing})
+    local primary=${patterns[1]}
+
+    local p q
+    for q in "$@"; do
+        if [[ $q == "$primary" ]]; then
+            die "'$q' is the name '$name' is managed under, not an alias  (skm rm $name removes the host itself)"
+        fi
+    done
+
+    # Patterns are compared as text, not matched: '*.internal' takes off the
+    # alias spelled '*.internal' and nothing else.
+    local -a keep=("$primary") gone=() missing=()
+    for p in "${(@)patterns[2,-1]}"; do
+        if (( ${argv[(Ie)$p]} )); then gone+=("$p"); else keep+=("$p"); fi
+    done
+    for q in "$@"; do
+        (( ${patterns[(Ie)$q]} )) || missing+=("$q")
+    done
+    (( ${#missing} == 0 )) || warn "not an alias of '$name': ${missing[*]}"
+
+    if (( ${#gone} == 0 )); then
+        info "still matched by: Host $existing"
+        return
+    fi
+
+    replace_conf_line "$conf" Host "Host ${keep[*]}"
+    info "removed: ${gone[*]}"
+    info "Host ${keep[*]}"
+}
+
+# PRIVATE is a plain look on disk, so listing stays free: no vault is opened
+# and no password asked for. "absent" therefore means only that the private
+# key is not here -- it is in the vault, or it is gone, and `skm status`
+# is what tells the two apart.
 cmd_list() {
     [[ -d $CONF_DIR ]] || die "nothing managed yet"
-    local f name target id agent
-    print -f '%-14s %-28s %s\n' NAME TARGET KEY
+    local f name target id agent priv
+    print -f '%-14s %-28s %-8s %s\n' NAME TARGET PRIVATE KEY
     # (N) is zsh's nullglob qualifier: an empty directory yields zero
     # iterations instead of a literal '*.conf'.
     for f in $CONF_DIR/*.conf(N); do
@@ -502,7 +524,9 @@ cmd_list() {
         id=$(identity_of "$f")
         agent=""
         [[ $id == *.pub ]] && agent="  (agent)"
-        print -f '%-14s %-28s %s%s\n' "$name" "$target" "${id:t}" "$agent"
+        priv="absent"
+        [[ -f $(keyfile "$name") ]] && priv="on disk"
+        print -f '%-14s %-28s %-8s %s%s\n' "$name" "$target" "$priv" "${id:t}" "$agent"
     done
 }
 
@@ -657,15 +681,21 @@ status_one() {
     print
 }
 
+# The database can be named with -d, as `scope` takes it. A bare path ending
+# in .kdbx is still understood, which is how it was always written; -d is what
+# a database named anything else needs, so that it is read as a database and
+# not as a host name.
 cmd_status() {
-    local a db=""
+    local db=""
     local -a args=()
-    for a in "$@"; do
-        if [[ $a == *.kdbx ]]; then
-            db=$a
-        else
-            args+=("$a")
-        fi
+    while (( $# > 0 )); do
+        case $1 in
+            -d|--db) db=${2:?}; shift 2 ;;
+            --all)   args+=("$1"); shift ;;
+            -*)      die "unknown flag: $1" ;;
+            *.kdbx)  db=$1; shift ;;
+            *)       args+=("$1"); shift ;;
+        esac
     done
     [[ -z $db || -f $db ]] || die "no such database: $db"
 
@@ -873,11 +903,10 @@ cmd_agent() {
     require_host "$name" "usage: skm agent <name>"
     retarget "$name" agent
     info "$name now resolves its key via the ssh-agent"
-    if (( $+commands[shred] )); then            # zsh: $+commands[x] tests PATH
-        info "once verified: shred -u $(keyfile "$name")"
-    else
-        info "once verified: rm -P $(keyfile "$name")"    # BSD/macOS
-    fi
+    # Deleting the key by hand is a step with nothing checking it: `drop`
+    # compares the copy in the vault against the one on disk first, and so
+    # cannot take away the only copy there is.
+    info "once a login works: skm drop $name <database.kdbx> takes the private key off disk"
 }
 
 cmd_ondisk() {
@@ -1865,16 +1894,54 @@ cmd_unscope() {
 
 # ---------------------------------------------------------------- dispatch
 
-# The command summary at the top of this file is the help text; printing it
-# from there keeps the two from drifting apart. $0 inside a zsh function is the
-# function's own name, so the script's path has to be captured out here.
-SKM_SELF=$0
-usage() { sed -n '3,34p' "$SKM_SELF" | sed 's/^# \?//' }
+# The version this file is; `skm --version` prints it.
+SKM_VERSION=0.1.0
+
+usage() {
+    cat <<'EOF'
+skm — a small per-host SSH key manager.
+
+  skm add <name> <user@host> [port]   generate key + config entry
+  skm provision <name> <user@host> [port] <db.kdbx>
+                                      add + export + drop, in one go; re-run
+                                      it to finish a run that stopped early
+  skm alias <name> <pattern>...       let more names/IPs/globs use this key
+  skm unalias <name> <pattern>...     take those names back off the key
+  skm list                            show managed hosts
+  skm status [name|--all] [-d db.kdbx]
+                                      show where each key's private/public half lives
+  skm show <name>                     print the public key
+  skm copy <name>                     ssh-copy-id the key to the server
+  skm rm <name> [db.kdbx]             delete key + config (+ vault entry)
+  skm export [--force] <name|--all> <db.kdbx>
+                                      import key into KeePassXC as an agent key
+  skm drop [--force] <name> <db.kdbx> remove local key (fingerprint-verified)
+  skm restore [--force] <name> <db.kdbx>
+                                      pull key from KeePassXC back to disk
+  skm agent <name>                    point IdentityFile at the .pub (agent supplies private)
+  skm ondisk <name>                   undo `agent`
+  skm scope <label> [-c] [-t 8h] [-d db.kdbx] <name>...
+                                      start an agent holding ONLY those keys
+  skm scopes                          list scoped agents and what's in them
+  skm unscope <label>                 kill a scoped agent
+  skm help                            this summary
+  skm --version                       print the version
+
+Settings, taken from the environment:
+  SKM_SSH_DIR                the directory skm manages (default ~/.ssh)
+  SKM_KEEPASS_GROUP          group the entries live in (default "SSH Keys")
+  SKM_KEEPASS_KEYFILE        key file the database also needs to unlock
+  SKM_KEEPASS_YUBIKEY        hardware key slot[:serial] the database needs
+  SKM_KEEPASS_NO_PASSWORD    set for a database with no password at all
+  SKM_KEEPASS_PASSWORD_FILE  file whose first line is the database password
+EOF
+}
 
 case "${1:-help}" in
     add)       shift; cmd_add       "$@" ;;
     provision) shift; cmd_provision "$@" ;;
     alias)   shift; cmd_alias   "$@" ;;
+    unalias) shift; cmd_unalias "$@" ;;
     list)    shift; cmd_list    "$@" ;;
     status)  shift; cmd_status  "$@" ;;
     show)    shift; cmd_show    "$@" ;;
@@ -1889,6 +1956,7 @@ case "${1:-help}" in
     scopes)  shift; cmd_scopes  "$@" ;;
     unscope) shift; cmd_unscope "$@" ;;
     help|-h|--help) usage ;;
+    version|-V|--version) print -r -- "skm $SKM_VERSION (zsh port)" ;;
     # A mistyped command must not look like a successful run: scripts that
     # check the exit status would otherwise sail past it.
     *)       print -u2 "skm: unknown command '$1'"; usage >&2; exit 2 ;;

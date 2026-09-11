@@ -597,6 +597,16 @@ teardown() { skm_teardown; }
     assert_output_has "LOST"
 }
 
+@test "a database named something other than .kdbx is read when -d names it" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    cp "$DB" "$SKM_TMP/vault.db"
+
+    run skm_answer "$DB_PW" -- status -d "$SKM_TMP/vault.db" box
+    assert_ok
+    assert_output_has "fingerprint   match"
+}
+
 # ------------------------------------------------------------- provision
 
 @test "provision chains add, export and drop into one key" {
