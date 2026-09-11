@@ -421,6 +421,59 @@ Include other.d/*.conf
     assert_no_file "$(conffile box).bak"
 }
 
+@test "agent rebuilds a public key that has gone missing" {
+    add_host box
+    local fp; fp=$(fingerprint "$(keyfile box)")
+    rm -f "$(keyfile box).pub"
+
+    run skm agent box
+    assert_ok
+    assert_file "$(keyfile box).pub"
+    assert_equal "$(fingerprint "$(keyfile box).pub")" "$fp"
+    assert_equal "$(identity_file box)" "$(keyfile box).pub"
+}
+
+@test "agent asks for the passphrase when it has to rebuild the public key" {
+    add_host box
+    encrypt_key box 'sekrit pass'
+    local fp; fp=$(fingerprint "$(keyfile box)")
+    rm -f "$(keyfile box).pub"
+
+    run skm_answer 'sekrit pass' -- agent box
+    assert_ok
+    assert_equal "$(fingerprint "$(keyfile box).pub")" "$fp"
+}
+
+@test "agent leaves the config alone when the passphrase is wrong" {
+    add_host box
+    encrypt_key box 'sekrit pass'
+    rm -f "$(keyfile box).pub"
+
+    run skm_answer wrong -- agent box
+    assert_fails
+    assert_no_file "$(keyfile box).pub"
+    assert_equal "$(identity_file box)" "$(keyfile box)"
+}
+
+@test "agent refuses when neither half of the key is on disk" {
+    add_host box
+    rm -f "$(keyfile box)" "$(keyfile box).pub"
+
+    run skm agent box
+    assert_fails
+    assert_output_has "no public key on disk"
+    assert_equal "$(identity_file box)" "$(keyfile box)"
+}
+
+@test "ondisk needs no public key" {
+    add_host box
+    rm -f "$(keyfile box).pub"
+
+    run skm ondisk box
+    assert_ok
+    assert_equal "$(identity_file box)" "$(keyfile box)"
+}
+
 @test "agent keeps the indentation of the IdentityFile line" {
     add_host box
     skm agent box >/dev/null

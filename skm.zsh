@@ -639,6 +639,34 @@ cmd_rm() {
     info "removed $name"
 }
 
+# The public key is what agent mode points ssh at, so it has to be on disk for
+# the host to work at all. It is also derivable from the private key, so a
+# missing one is repaired rather than reported whenever the private half is
+# still there; once it is gone, nothing local can rebuild it and the vault is
+# the only way back.
+ensure_pub() {   # name -> a .pub on disk, or die trying
+    local name=$1
+    local key=$(keyfile "$name")
+    if [[ -f $key.pub ]]; then return 0; fi
+    [[ -f $key ]] || die "no public key on disk for '$name', and no private key to rebuild it from -- 'skm restore $name <database.kdbx>' brings both back"
+
+    info "no public key on disk for '$name'; rebuilding $key.pub from the private key"
+    key_passphrase "$key"
+    write_pub "$key" "$KEY_PASS"
+    KEY_PASS=""
+}
+
+# Derive the public half of a key and put it on disk. The write lands in a
+# temp file first: a half-written .pub left behind by a failure looks exactly
+# like a good one to everything that checks for the file.
+write_pub() {   # key passphrase
+    local key=$1 pass=$2
+    local tmp=$(mktemp "${TMPDIR:-/tmp}/skm.XXXXXX")
+    ssh-keygen -y -P "$pass" -f "$key" > "$tmp" \
+        || { rm -f "$tmp"; die "could not derive the public key from $key" }
+    mv "$tmp" "$key.pub"
+}
+
 # Swap IdentityFile between the private key on disk and the .pub stub.
 # With the .pub, ssh asks the agent (KeePassXC) for the matching private key —
 # so the private key never has to exist on disk at all.
@@ -647,7 +675,8 @@ retarget() {
     local conf=$(conffile "$name")
     local key=$(keyfile "$name")
     case $to in
-        agent)  replace_conf_line "$conf" IdentityFile "IdentityFile \"$key.pub\"" ;;
+        agent)  ensure_pub "$name"
+                replace_conf_line "$conf" IdentityFile "IdentityFile \"$key.pub\"" ;;
         ondisk) replace_conf_line "$conf" IdentityFile "IdentityFile \"$key\""     ;;
     esac
 }
@@ -924,7 +953,6 @@ export_one() {
     local entry="$KP_GROUP/$name"
     local base=${key:t}
     local pub=$key.pub
-    local pubtmp=""
 
     [[ -f $key ]] || die "no private key on disk for '$name' (already exported?)"
 
@@ -932,10 +960,13 @@ export_one() {
     # refused outright rather than half-written into the database.
     key_passphrase "$key"
 
+    # The public half goes back to disk, not just into the vault: once the
+    # private key is dropped, that file is what ssh is told to offer, and a
+    # host whose .pub went missing would otherwise be left unusable with
+    # nothing local to rebuild it from.
     if [[ ! -f $pub ]]; then
-        pubtmp=$(mktemp "${TMPDIR:-/tmp}/skm.XXXXXX")
-        ssh-keygen -y -P "$KEY_PASS" -f "$key" > "$pubtmp"
-        pub=$pubtmp
+        info "no public key on disk for '$name'; rebuilding $pub from the private key"
+        write_pub "$key" "$KEY_PASS"
     fi
 
     # Whether the entry is already there was settled by the caller's one
@@ -969,7 +1000,7 @@ export_one() {
         || kp_die "could not store '$base.pub' in '$entry'"
     run_kp attachment-import -f "$db" "$entry" "KeeAgent.settings" "$tmp" \
         || kp_die "could not store 'KeeAgent.settings' in '$entry'"
-    rm -f "$tmp" "$pubtmp"
+    rm -f "$tmp"
 
     if [[ -n $KEY_PASS ]]; then
         info "exported $name -> $entry (private + public key, passphrase in Password)"
@@ -1112,6 +1143,10 @@ cmd_drop() {
         esac
     fi
 
+    # Before the private key goes, not after: rebuilding the public half needs
+    # it, and agent mode is only usable with that file in place.
+    ensure_pub "$name"
+
     secure_rm "$key"
     retarget "$name" agent
 
@@ -1160,10 +1195,8 @@ cmd_restore() {
     kp_attachment_export "$db" "$entry" "$base.pub" "$key.pub" || rc=$?
     case $rc in
         0) ;;
-        1) if [[ ! -f $key.pub ]]; then
-               info "no public key attachment in $entry; regenerating from the private key"
-               ssh-keygen -y -f "$key" > "$key.pub"
-           fi ;;
+        1) info "no public key attachment in $entry"
+           ensure_pub "$name" ;;
         *) kp_die "could not read $db" ;;
     esac
 

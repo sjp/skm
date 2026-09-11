@@ -184,6 +184,17 @@ teardown() { skm_teardown; }
     assert_output_has "id_ed25519_box.pub"
 }
 
+@test "export leaves the rebuilt public key on disk as well as in the vault" {
+    add_host box
+    local fp; fp=$(fingerprint "$(keyfile box)")
+    rm -f "$(keyfile box).pub"
+
+    run skm_answer "$DB_PW" -- export box "$DB"
+    assert_ok
+    assert_file "$(keyfile box).pub"
+    assert_equal "$(fingerprint "$(keyfile box).pub")" "$fp"
+}
+
 @test "export rejects an unknown flag" {
     add_host box
     run skm_answer "$DB_PW" -- export --wat box "$DB"
@@ -209,6 +220,20 @@ teardown() { skm_teardown; }
     # the vault copy is untouched, so the key is not lost
     vault_export_key box "$SKM_TMP/from-vault"
     assert_equal "$(fingerprint "$SKM_TMP/from-vault")" "$fp"
+}
+
+@test "drop rebuilds a missing public key before deleting the private one" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    local fp; fp=$(fingerprint "$(keyfile box)")
+    rm -f "$(keyfile box).pub"
+
+    run skm_answer "$DB_PW" y -- drop box "$DB"
+    assert_ok
+    assert_no_file "$(keyfile box)"
+    assert_file "$(keyfile box).pub"
+    assert_equal "$(fingerprint "$(keyfile box).pub")" "$fp"
+    assert_equal "$(identity_file box)" "$(keyfile box).pub"
 }
 
 @test "drop keeps the key when the answer is no" {
