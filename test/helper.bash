@@ -21,8 +21,14 @@ skm_setup() {
     export HOME="$SKM_TMP"
     export SSH_DIR="$SKM_TMP/.ssh"
     export XDG_CONFIG_HOME="$SKM_TMP/config"   # keepassxc-cli settings land here
-    mkdir -p "$SSH_DIR" "$XDG_CONFIG_HOME"
-    chmod 700 "$SSH_DIR"
+
+    # Keys taken out of a vault are written below the runtime directory, so
+    # pointing that at the sandbox keeps a copy left behind by a failing run
+    # inside the sandbox -- where teardown removes it and a test can see it --
+    # rather than in the machine's shared memory.
+    export XDG_RUNTIME_DIR="$SKM_TMP/run"
+    mkdir -p "$SSH_DIR" "$XDG_CONFIG_HOME" "$XDG_RUNTIME_DIR"
+    chmod 700 "$SSH_DIR" "$XDG_RUNTIME_DIR"
 
     # An agent inherited from whoever ran the suite would show up in the
     # "is the key loaded?" checks and make results depend on the environment.
@@ -67,6 +73,17 @@ trace_setup() {   # command...
         } > "$TRACE_BIN/$cmd"
         chmod +x "$TRACE_BIN/$cmd"
     done
+}
+
+# An ssh-add that takes no key, the way one fed a passphrase nobody typed
+# correctly behaves:
+#     refusing_ssh_add
+#     PATH="$REFUSE_BIN:$PATH" run skm_answer "$DB_PW" -- scope work -d "$DB" box
+refusing_ssh_add() {
+    REFUSE_BIN="$SKM_TMP/refuse-bin"
+    mkdir -p "$REFUSE_BIN"
+    printf '#!/bin/sh\nexit 1\n' > "$REFUSE_BIN/ssh-add"
+    chmod +x "$REFUSE_BIN/ssh-add"
 }
 
 skm_teardown() {
@@ -210,6 +227,32 @@ SHIM
     : > "$KP_CALLS"
 }
 
+# A keepassxc-cli that cannot write an attachment to standard output, which is
+# how every version before 2.7 behaves. Prefixing it exercises the route that
+# has to put the key in a file first:
+#     no_stdout_kp
+#     PATH="$NO_STDOUT_BIN:$PATH" run skm_answer "$DB_PW" -- scope work -d "$DB" box
+no_stdout_kp() {
+    NO_STDOUT_BIN="$SKM_TMP/no-stdout-bin"
+    local real
+    if command -v keepassxc-cli >/dev/null 2>&1; then
+        real=$(command -v keepassxc-cli)
+    else
+        real=$KP_APP_BUNDLE
+    fi
+    mkdir -p "$NO_STDOUT_BIN"
+    # keepassxc-cli writes its help to stderr, so that is the copy to edit.
+    cat > "$NO_STDOUT_BIN/keepassxc-cli" <<SHIM
+#!/bin/sh
+if [ "\$1" = attachment-export ] && [ "\$2" = --help ]; then
+    "$real" "\$@" 2>&1 | grep -v -- --stdout >&2
+    exit 0
+fi
+exec "$real" "\$@"
+SHIM
+    chmod +x "$NO_STDOUT_BIN/keepassxc-cli"
+}
+
 # Calls since the last kp_shim_setup: all of them, or just one subcommand's.
 kp_calls()    { wc -l < "$KP_CALLS" | tr -d ' '; }
 kp_calls_of() { grep -c "^$1\$" "$KP_CALLS" || true; }
@@ -270,6 +313,16 @@ assert_mode() {
     local got; got=$(file_mode "$1")
     [ "$got" = "$2" ] && return 0
     printf 'expected mode %s on %s, got %s\n' "$2" "$1" "$got" >&2
+    return 1
+}
+
+# A run that is over should have taken every key it extracted with it,
+# whether it succeeded, failed or was interrupted.
+assert_no_extracted_keys() {
+    local left
+    left=$(find "$XDG_RUNTIME_DIR" -maxdepth 1 -name 'skm.*' 2>/dev/null)
+    [ -z "$left" ] && return 0
+    printf 'expected no extracted keys, found:\n%s\n' "$(find "$XDG_RUNTIME_DIR" -name 'skm.*')" >&2
     return 1
 }
 

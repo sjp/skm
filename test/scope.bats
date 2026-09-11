@@ -157,6 +157,48 @@ agent_fingerprints() {
     assert_no_file "$(keyfile box)"
 }
 
+@test "a key the agent will not take leaves no copy of itself behind" {
+    require_keepassxc
+    make_vault
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    skm_answer "$DB_PW" y -- drop box "$DB" >/dev/null
+
+    refusing_ssh_add
+    PATH="$REFUSE_BIN:$PATH" run skm_answer "$DB_PW" -- scope work -d "$DB" box
+    assert_fails
+    assert_no_extracted_keys
+}
+
+@test "a vault that cannot pipe the key still loads it and takes the copy away" {
+    require_keepassxc
+    make_vault
+    add_host box
+    local fp; fp=$(fingerprint "$(keyfile box)")
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    skm_answer "$DB_PW" y -- drop box "$DB" >/dev/null
+
+    no_stdout_kp
+    PATH="$NO_STDOUT_BIN:$PATH" run skm_answer "$DB_PW" -- scope work -d "$DB" box
+    assert_ok
+    assert_equal "$(agent_fingerprints work)" "$fp"
+    assert_no_extracted_keys
+}
+
+@test "a key written out for an agent that refuses it does not survive" {
+    require_keepassxc
+    make_vault
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    skm_answer "$DB_PW" y -- drop box "$DB" >/dev/null
+
+    no_stdout_kp
+    refusing_ssh_add
+    PATH="$REFUSE_BIN:$NO_STDOUT_BIN:$PATH" run skm_answer "$DB_PW" -- scope work -d "$DB" box
+    assert_fails
+    assert_no_extracted_keys
+}
+
 @test "a scoped vault key opens the database the same way every command does" {
     require_keepassxc
     make_vault

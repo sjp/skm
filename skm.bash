@@ -504,7 +504,7 @@ status_one() {
     local priv_vault="?" pub_vault="?" vault_fp="" fp_status="n/a (no db)" vault_err=""
     if [[ -n $db ]]; then
         local entry="$KP_GROUP/$name" base; base=$(basename "$key")
-        local tmpdir; tmpdir=$(ramtemp)
+        ramtemp; local tmpdir=$SKM_TMPSUB
         local rc=0
         kp_attachment_export "$db" "$entry" "$base" "$tmpdir/$base" || rc=$?
         case $rc in
@@ -519,7 +519,7 @@ status_one() {
             1) pub_vault="no" ;;
             *) pub_vault="error"; vault_err=$KP_ERR ;;
         esac
-        rm -rf "$tmpdir"
+        wipe_tmp "$tmpdir"
 
         if [[ $priv_vault == error ]]; then
             fp_status="n/a (vault could not be read)"
@@ -740,10 +740,12 @@ ensure_pub() {   # name -> a .pub on disk, or die trying
 }
 
 # Derive the public half of a key and put it on disk. The write lands in a
-# temp file first: a half-written .pub left behind by a failure looks exactly
-# like a good one to everything that checks for the file.
+# temp file first, beside the key rather than off in temporary space: moving
+# it into place is then a rename within the one directory, which either
+# happened or did not. A half-written .pub looks exactly like a good one to
+# everything that checks for the file.
 write_pub() {   # key passphrase
-    local key=$1 pass=$2 tmp; tmp=$(mktemp "${TMPDIR:-/tmp}/skm.XXXXXX")
+    local key=$1 pass=$2 tmp; tmp=$(mktemp "$key.pub.XXXXXX")
     ssh-keygen -y -P "$pass" -f "$key" > "$tmp" \
         || { rm -f "$tmp"; die "could not derive the public key from $key"; }
     mv "$tmp" "$key.pub"
@@ -880,9 +882,16 @@ kp_call() {   # stdin-text subcommand arg...
     # unset variable under `set -u`; this spelling expands to nothing at all
     # rather than stopping the run when there are no options to pass.
     err=$(printf '%s\n' "$input" | "$KP_CLI" "$sub" ${KP_AUTH[@]+"${KP_AUTH[@]}"} "$@" 2>&1 >/dev/null) || rc=$?
-    KP_ERR=$(printf '%s\n' "$err" | sed -e 's/^Enter password to unlock .*: //' \
-                                        -e 's/^Enter [a-z ]*password for[^:]*: //' -e '/^$/d')
+    kp_set_err "$err"
     return "$rc"
+}
+
+# What keepassxc-cli wrote to stderr, less the prompts it writes there even
+# when the answers arrive on stdin: those are not diagnostics, and a caller
+# quoting them back would be quoting its own question.
+kp_set_err() {   # stderr-text
+    KP_ERR=$(printf '%s\n' "$1" | sed -e 's/^Enter password to unlock .*: //' \
+                                       -e 's/^Enter [a-z ]*password for[^:]*: //' -e '/^$/d')
 }
 
 run_kp() {   # subcommand arg...
@@ -975,6 +984,52 @@ kp_attachment_export() {   # db entry attachment dest
     return 2
 }
 
+# Whether this keepassxc-cli can write an attachment to its standard output.
+# One that cannot has to be given a path to write the key to, which means the
+# key exists as a file, however briefly. The answer is in --help, so asking
+# costs no unlock, and it is asked once.
+KP_STDOUT=-1
+kp_has_stdout() {
+    if ((KP_STDOUT < 0)); then
+        local help=""
+        help=$("$KP_CLI" attachment-export --help 2>&1) || true
+        if [[ $help == *--stdout* ]]; then KP_STDOUT=1; else KP_STDOUT=0; fi
+    fi
+    ((KP_STDOUT))
+}
+
+# Hand a stored key straight to an agent: out of the database, down a pipe,
+# into ssh-add, a file at no point. The two ends of the pipe are judged
+# separately, because a database that would not open and an agent that turned
+# the key down are different failures and only one of them is about the key.
+#
+#   0  loaded        1  no such attachment
+#   2  database unreadable (KP_ERR says why)      3  ssh-add would not take it
+kp_add_to_agent() {   # db entry attachment ssh-add-flag...
+    local db=$1 entry=$2 att=$3; shift 3
+    ensure_tmpdir
+    local errf; errf=$(mktemp "$SKM_TMPDIR/err.XXXXXX")
+
+    # A failing pipeline would otherwise end the run on the spot, and which
+    # end of it failed is the whole question here.
+    set +e
+    printf '%s\n' "$KP_PW" \
+        | "$KP_CLI" attachment-export ${KP_AUTH[@]+"${KP_AUTH[@]}"} --stdout "$db" "$entry" "$att" 2>"$errf" \
+        | ssh-add "$@" -
+    local st=("${PIPESTATUS[@]}")
+    set -e
+
+    kp_set_err "$(cat "$errf")"
+    rm -f "$errf"
+
+    if ((st[1] != 0)); then
+        if kp_absent; then return 1; fi
+        return 2
+    fi
+    ((st[2] == 0)) || return 3
+    return 0
+}
+
 # SHA256 fingerprint only (no comment/bit-count noise), so a match is a real
 # match. Works on a private key without its passphrase.
 key_fingerprint() {   # file -> "SHA256:..."  (prints nothing on failure)
@@ -1015,16 +1070,63 @@ secure_rm() {   # file -> best-effort secure delete
     fi
 }
 
-ramtemp() {   # -> path to a fresh 0700 dir, RAM-backed if the platform has one
+# Everything this run takes out of the vault -- a private key on its way into
+# an agent, a public half on its way back to disk -- is written below one
+# directory, made the first time something needs it. Where the platform offers
+# memory to write to, that is where it goes: a copy that was never on a medium
+# cannot be read off one afterwards. Linux has two such places; macOS has
+# none, so there it falls back to ordinary temporary space.
+SKM_TMPDIR=""
+SKM_TMP_RAM=0
+SKM_TMPSUB=""
+
+# The directory is left in $SKM_TMPDIR rather than printed: printed, every
+# caller would reach for it through $( ), the assignment would happen in the
+# subshell that runs it, and the run itself would end up knowing nothing about
+# a directory full of keys.
+ensure_tmpdir() {   # -> $SKM_TMPDIR, a 0700 directory made on first use
+    [[ -n $SKM_TMPDIR ]] && return 0
     local base
-    if   [[ -d ${XDG_RUNTIME_DIR:-} ]]; then base=$XDG_RUNTIME_DIR
-    elif [[ -d /dev/shm ]];             then base=/dev/shm
-    else                                     base=${TMPDIR:-/tmp}
+    if   [[ -d ${XDG_RUNTIME_DIR:-} ]]; then base=$XDG_RUNTIME_DIR; SKM_TMP_RAM=1
+    elif [[ -d /dev/shm ]];             then base=/dev/shm;         SKM_TMP_RAM=1
+    else                                     base=${TMPDIR:-/tmp};  SKM_TMP_RAM=0
     fi
-    local d; d=$(mktemp -d "$base/skm.XXXXXX")
-    chmod 700 "$d"
-    printf '%s\n' "$d"
+    SKM_TMPDIR=$(mktemp -d "$base/skm.XXXXXX")
+    chmod 700 "$SKM_TMPDIR"
 }
+
+# Answers in $SKM_TMPSUB for the reason ensure_tmpdir does: read through
+# $( ), the directory would be made by a subshell and known only to it.
+ramtemp() {   # -> $SKM_TMPSUB, a fresh 0700 dir inside the run's own directory
+    ensure_tmpdir
+    SKM_TMPSUB=$(mktemp -d "$SKM_TMPDIR/d.XXXXXX")
+    chmod 700 "$SKM_TMPSUB"
+}
+
+# Unlinking a file is the whole of deleting it only where the file was never
+# on a disk. Anywhere else its bytes stay on the medium until something writes
+# over them, so off memory each one goes through the overwriting delete first.
+wipe_tmp() {   # dir
+    local d=${1:-} f
+    [[ -n $d && -d $d ]] || return 0
+    if ((! SKM_TMP_RAM)); then
+        while IFS= read -r f; do secure_rm "$f"; done < <(find "$d" -type f)
+    fi
+    rm -rf "$d"
+}
+
+# An extracted key must not outlive the command that extracted it. Between the
+# two there is a passphrase to mistype, a prompt to answer wrongly and a
+# Ctrl-C to hit, and each of those ends the run somewhere other than the line
+# that cleans up -- so the cleanup hangs on the way out instead, which is the
+# one place all of them go through.
+skm_cleanup() {
+    wipe_tmp "$SKM_TMPDIR"
+    SKM_TMPDIR=""
+}
+trap 'skm_cleanup' EXIT
+trap 'skm_cleanup; exit 130' INT
+trap 'skm_cleanup; exit 143' TERM
 
 export_one() {
     local name=$1 db=$2 exists=${3:-0}
@@ -1066,7 +1168,8 @@ export_one() {
             || kp_die "could not create entry '$entry'"
     fi
 
-    local tmp; tmp=$(mktemp "${TMPDIR:-/tmp}/skm.XXXXXX")   # BSD mktemp needs a template
+    ensure_tmpdir
+    local tmp; tmp=$(mktemp "$SKM_TMPDIR/keeagent.XXXXXX")   # BSD mktemp needs a template
     keeagent_xml "$base" > "$tmp"
 
     # -f replaces an attachment that is already stored, which is what updating
@@ -1222,15 +1325,15 @@ cmd_drop() {
     local have; have=$(key_fingerprint "$key")
     [[ -n $have ]] || die "could not read local key: $key"
 
-    local tmpdir; tmpdir=$(ramtemp)
+    ramtemp; local tmpdir=$SKM_TMPSUB
     local vault_key="$tmpdir/$base" vault_fp="" rc=0
     kp_attachment_export "$db" "$entry" "$base" "$vault_key" || rc=$?
     case $rc in
         0) vault_fp=$(key_fingerprint "$vault_key") ;;
         1) ;;   # the key really isn't stored under this entry
-        *) rm -rf "$tmpdir"; kp_die "could not read $db" ;;
+        *) wipe_tmp "$tmpdir"; kp_die "could not read $db" ;;
     esac
-    rm -rf "$tmpdir"
+    wipe_tmp "$tmpdir"
 
     echo
     info "local:  $have"
@@ -1292,18 +1395,18 @@ cmd_restore() {
     # Both halves come out into a private temp dir first. What an attachment
     # holds is only a key if it parses as one, and something that doesn't must
     # never reach the key's place on disk, nor have the host pointed at it.
-    local tmpdir; tmpdir=$(ramtemp)
+    ramtemp; local tmpdir=$SKM_TMPSUB
     local rc=0
     kp_attachment_export "$db" "$entry" "$base" "$tmpdir/$base" || rc=$?
     case $rc in
         0) ;;
-        1) rm -rf "$tmpdir"; die "no key attachment for '$name' in $entry" ;;
-        *) rm -rf "$tmpdir"; kp_die "could not read $db" ;;
+        1) wipe_tmp "$tmpdir"; die "no key attachment for '$name' in $entry" ;;
+        *) wipe_tmp "$tmpdir"; kp_die "could not read $db" ;;
     esac
 
     local vault_fp; vault_fp=$(key_fingerprint "$tmpdir/$base")
     if [[ -z $vault_fp ]]; then
-        rm -rf "$tmpdir"
+        wipe_tmp "$tmpdir"
         die "the key attachment in $entry is not a readable private key -- nothing on disk was changed"
     fi
 
@@ -1313,7 +1416,7 @@ cmd_restore() {
     case $rc in
         0) have_pub=1 ;;
         1) info "no public key attachment in $entry" ;;
-        *) rm -rf "$tmpdir"; kp_die "could not read $db" ;;
+        *) wipe_tmp "$tmpdir"; kp_die "could not read $db" ;;
     esac
 
     # A key on disk that isn't the vault copy is a second key, not a stale copy
@@ -1333,7 +1436,7 @@ cmd_restore() {
             fi
             local ans=""
             read -rp "replace '$key' with the vault copy? [y/N] " ans || ans=""
-            [[ ${ans,,} == y* ]] || { rm -rf "$tmpdir"; info "aborted"; return; }
+            [[ ${ans,,} == y* ]] || { wipe_tmp "$tmpdir"; info "aborted"; return; }
             local backup
             backup="$key.bak-$(date +%Y%m%dT%H%M%S)"
             mv "$key" "$backup"
@@ -1348,7 +1451,7 @@ cmd_restore() {
         mv "$tmpdir/$base.pub" "$key.pub"
         chmod 600 "$key.pub"
     fi
-    rm -rf "$tmpdir"
+    wipe_tmp "$tmpdir"
     ((have_pub)) || ensure_pub "$name"
 
     retarget "$name" ondisk
@@ -1402,7 +1505,7 @@ cmd_scope() {
     ((confirm))    && flags+=(-c)
     [[ -n $ttl ]]  && flags+=(-t "$ttl")
 
-    local n key tmp base_dir rc unlocked=0
+    local n key tmp rc unlocked=0
     for n in "${names[@]}"; do
         require_host "$n"
         key=$(keyfile "$n")
@@ -1410,10 +1513,11 @@ cmd_scope() {
         if [[ -f $key ]]; then
             ssh-add "${flags[@]}" "$key"
         elif [[ -n $db ]]; then
-            # Key lives in KeePassXC only. Pull it out, load it, wipe it.
-            # /dev/shm is RAM-backed so it never hits disk — but it's a Linux
-            # thing. macOS has no equivalent, so the copy is briefly on disk
-            # there; we unlink it immediately after ssh-add.
+            # The key lives in KeePassXC only. Where keepassxc-cli can write
+            # an attachment to its standard output it goes straight down a
+            # pipe into the agent and is never a file at all; where it cannot,
+            # it comes out into the run's own directory, which is memory where
+            # the platform has any and is wiped however the run ends.
             #
             # The database is opened the once, however many keys come out of
             # it, and by the same route as everywhere else: whatever unlocks
@@ -1423,23 +1527,37 @@ cmd_scope() {
                 kp_password "$db"
                 unlocked=1
             fi
-            if   [[ -d ${XDG_RUNTIME_DIR:-} ]]; then base_dir=$XDG_RUNTIME_DIR
-            elif [[ -d /dev/shm ]];             then base_dir=/dev/shm
-            else                                     base_dir=${TMPDIR:-/tmp}
+            # Said before the agent asks for anything: a key that arrives down
+            # a pipe has no file name for ssh-add to name in its passphrase
+            # prompt, and "(stdin)" tells nobody which key is being asked for.
+            info "adding '$n' from $db"
+            if kp_has_stdout; then
+                rc=0
+                kp_add_to_agent "$db" "$KP_GROUP/$n" \
+                    "$(basename "$key")" "${flags[@]}" || rc=$?
+                case $rc in
+                    0) ;;
+                    1) die "no key attachment for '$n' in $KP_GROUP/$n" ;;
+                    2) kp_die "could not read $db" ;;
+                    *) die "ssh-add would not take the key for '$n'" ;;
+                esac
+            else
+                ramtemp; tmp=$SKM_TMPSUB
+                rc=0
+                kp_attachment_export "$db" "$KP_GROUP/$n" \
+                    "$(basename "$key")" "$tmp/$n" || rc=$?
+                case $rc in
+                    0) ;;
+                    1) wipe_tmp "$tmp"; die "no key attachment for '$n' in $KP_GROUP/$n" ;;
+                    *) wipe_tmp "$tmp"; kp_die "could not read $db" ;;
+                esac
+                chmod 600 "$tmp/$n"
+                if ! ssh-add "${flags[@]}" "$tmp/$n"; then
+                    wipe_tmp "$tmp"
+                    die "ssh-add would not take the key for '$n'"
+                fi
+                wipe_tmp "$tmp"
             fi
-            tmp=$(mktemp -d "$base_dir/skm.XXXXXX")
-            chmod 700 "$tmp"
-            rc=0
-            kp_attachment_export "$db" "$KP_GROUP/$n" \
-                "$(basename "$key")" "$tmp/$n" || rc=$?
-            case $rc in
-                0) ;;
-                1) rm -rf "$tmp"; die "no key attachment for '$n' in $KP_GROUP/$n" ;;
-                *) rm -rf "$tmp"; kp_die "could not read $db" ;;
-            esac
-            chmod 600 "$tmp/$n"
-            ssh-add "${flags[@]}" "$tmp/$n"
-            rm -rf "$tmp"
         else
             die "no key on disk for '$n' — pass -d <db.kdbx> to pull it from KeePassXC"
         fi

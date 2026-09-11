@@ -447,6 +447,18 @@ teardown() { skm_teardown; }
     assert_equal "$(fingerprint "$(keyfile box)")" "$fp"
 }
 
+@test "a restore that is called off keeps no copy of the key it pulled out" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    rm -f "$(keyfile box)" "$(keyfile box).pub"
+    ssh-keygen -q -t ed25519 -N '' -C other -f "$(keyfile box)"
+
+    run skm_answer "$DB_PW" -- restore --force box "$DB"
+    assert_ok
+    assert_output_has "aborted"
+    assert_no_extracted_keys
+}
+
 @test "restore --force keeps the displaced key beside the one it restored" {
     add_host box
     skm_answer "$DB_PW" -- export box "$DB" >/dev/null
