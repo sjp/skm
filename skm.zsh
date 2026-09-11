@@ -1511,6 +1511,51 @@ cmd_restore() {
 # agent containing just the key that container legitimately needs, and mount
 # only its socket. Everything else is unreachable — not "denied", but absent.
 
+# A scope's agent is shut down by pid: ssh-agent -k signals the process named
+# by SSH_AGENT_PID, and the socket path alone cannot ask it to stop. A pid file
+# outlives the process it names, though -- after a reboot, or once the agent has
+# been killed some other way, that number belongs to whatever the system handed
+# it to next -- so nothing is signalled until both the socket and the process
+# itself agree that the agent is still there.
+
+# Whether an agent answers on a socket. ssh-add exits 1 when the agent it
+# reached is holding no keys and 2 when it could reach no agent at all, so an
+# agent that has been emptied still counts as alive.
+agent_live() {   # socket
+    local sock=$1 rc=0
+    [[ -S $sock ]] || return 1
+    SSH_AUTH_SOCK=$sock ssh-add -l >/dev/null 2>&1 || rc=$?
+    (( rc == 0 || rc == 1 ))
+}
+
+# Whether a pid names an ssh-agent process. The comparison drops any leading
+# directory, since ps reports the command as a bare name on some platforms and
+# as a path on others.
+pid_is_agent() {   # pid
+    local pid=$1 comm=""
+    [[ -n $pid && $pid != *[!0-9]* ]] || return 1
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
+    [[ ${comm##*/} == ssh-agent ]]
+}
+
+# Take a scope down: the agent while it is still there to kill, and the socket
+# and pid file either way, so a label that is gone leaves nothing behind for a
+# later run to act on.
+kill_scope() {   # label -> 0 an agent was killed, 1 only leftovers were removed
+    local label=$1
+    local sock="$SOCK_DIR/$label.sock" pidf="$SOCK_DIR/$label.pid"
+    local pid="" rc=1
+    if [[ -f $pidf ]]; then pid=$(<"$pidf"); fi
+    if agent_live "$sock" && pid_is_agent "$pid"; then
+        if SSH_AGENT_PID=$pid SSH_AUTH_SOCK=$sock ssh-agent -k >/dev/null 2>&1; then
+            rc=0
+        fi
+    fi
+    rm -f "$sock" "$pidf"
+    return $rc
+}
+
+
 cmd_scope() {
     local label=${1:-}
     [[ -n $label ]] || die "usage: skm scope <label> [-c] [-t 8h] [-d db.kdbx] <name>..."
@@ -1533,10 +1578,13 @@ cmd_scope() {
     mkdir -p "$SOCK_DIR"; chmod 700 "$SOCK_DIR"
     local sock="$SOCK_DIR/$label.sock"
 
-    if [[ -S $sock ]] && SSH_AUTH_SOCK="$sock" ssh-add -l >/dev/null 2>&1; then
+    if agent_live "$sock"; then
         die "scope '$label' is already running (skm unscope $label to replace it)"
     fi
-    rm -f "$sock"
+    # A socket nothing answers on, and the pid file recorded beside it, are both
+    # remains of an agent that has gone: clearing the pid file here is what keeps
+    # a replaced scope from leaving a number behind that now belongs elsewhere.
+    rm -f "$sock" "$SOCK_DIR/$label.pid"
 
     # The agent inherits SSH_ASKPASS/DISPLAY from *this* shell, and it's the
     # agent that renders the -c confirmation dialog. Start it from a graphical
@@ -1643,13 +1691,11 @@ cmd_unscope() {
     local sock="$SOCK_DIR/$label.sock" pidf="$SOCK_DIR/$label.pid"
     [[ -S $sock || -f $pidf ]] || die "no such scope: $label"
 
-    # ssh-agent -k kills the agent named by SSH_AGENT_PID, so we need the pid
-    # we recorded at startup — the socket path alone isn't enough.
-    if [[ -f $pidf ]]; then
-        SSH_AGENT_PID="$(<$pidf)" SSH_AUTH_SOCK="$sock" ssh-agent -k >/dev/null 2>&1 || true
+    if kill_scope "$label"; then
+        info "killed scope '$label'"
+    else
+        info "scope '$label' was no longer running; removed its leftovers"
     fi
-    rm -f "$sock" "$pidf"
-    info "killed scope '$label'"
 }
 
 # ---------------------------------------------------------------- dispatch

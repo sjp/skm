@@ -246,3 +246,52 @@ agent_fingerprints() {
     assert_ok
     assert_output_lacks "still loaded"
 }
+
+@test "unscope spares an unrelated process when the pid file is stale" {
+    mkdir -p "$SSH_DIR/agents"
+    sleep 30 </dev/null >/dev/null 2>&1 &
+    local victim=$!
+    printf '%s\n' "$victim" > "$SSH_DIR/agents/work.pid"
+
+    run skm unscope work
+    assert_ok
+    assert_output_has "no longer running"
+
+    # the bystander that inherited the recorded pid is untouched
+    kill -0 "$victim"
+    kill "$victim" 2>/dev/null || true
+
+    assert_no_file "$SSH_DIR/agents/work.pid"
+}
+
+@test "unscope clears up after an agent that died on its own" {
+    add_host box
+    skm scope work box >/dev/null
+    local pid; pid=$(cat "$SSH_DIR/agents/work.pid")
+    kill "$pid"
+    while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
+
+    run skm unscope work
+    assert_ok
+    assert_output_has "no longer running"
+
+    assert_no_file "$SSH_DIR/agents/work.pid"
+    [ ! -S "$(sock_for work)" ]
+}
+
+@test "scope replaces a scope whose agent has gone" {
+    add_host box
+    skm scope work box >/dev/null
+    local pid; pid=$(cat "$SSH_DIR/agents/work.pid")
+    kill "$pid"
+    while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
+
+    run skm scope work box
+    assert_ok
+    assert_output_has "scope 'work' is live"
+
+    # the pid file names the new agent, not the one that is gone
+    local newpid; newpid=$(cat "$SSH_DIR/agents/work.pid")
+    [ "$newpid" != "$pid" ]
+    kill -0 "$newpid"
+}
