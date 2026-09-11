@@ -98,9 +98,12 @@ include_spellings() {
 # but nothing in them can override what that block has already set.
 include_state() {
     [[ -f $CONFIG ]] || { print -r -- "absent 0 0"; return }
-    awk -v spellings="$(include_spellings)" '
+    # Through the environment, as in replace_conf_line: the list is one
+    # spelling per line, and the awk macOS ships refuses a -v value that holds
+    # a newline.
+    SKM_SPELLINGS=$(include_spellings) awk '
         BEGIN {
-            n = split(spellings, s, "\n")
+            n = split(ENVIRON["SKM_SPELLINGS"], s, "\n")
             for (i = 1; i <= n; i++) want[s[i]] = 1
         }
         # The argument of Include is a list, and any member of it may be quoted.

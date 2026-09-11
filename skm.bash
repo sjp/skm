@@ -89,9 +89,12 @@ include_spellings() {
 # but nothing in them can override what that block has already set.
 include_state() {
     [[ -f $CONFIG ]] || { printf 'absent 0 0\n'; return; }
-    awk -v spellings="$(include_spellings)" '
+    # Through the environment, as in replace_conf_line: the list is one
+    # spelling per line, and the awk macOS ships refuses a -v value that holds
+    # a newline.
+    SKM_SPELLINGS=$(include_spellings) awk '
         BEGIN {
-            n = split(spellings, s, "\n")
+            n = split(ENVIRON["SKM_SPELLINGS"], s, "\n")
             for (i = 1; i <= n; i++) want[s[i]] = 1
         }
         # The argument of Include is a list, and any member of it may be quoted.
@@ -401,7 +404,8 @@ cmd_provision() {
     while :; do
         echo
         read -rp "press Enter to check the agent (or type 'skip' to continue anyway): " ans || ans=""
-        if [[ ${ans,,} == skip ]]; then
+        # Spelled out case by case: the bash macOS ships (3.2) has no ${ans,,}.
+        if [[ $ans == [Ss][Kk][Ii][Pp] ]]; then
             info "skipping agent verification"
             break
         fi
@@ -804,7 +808,7 @@ cmd_rm() {
     local ans=""
     if ((shown)); then echo; fi
     read -rp "delete key and config for '$name'? [y/N] " ans || ans=""
-    [[ ${ans,,} == y* ]] || { info "aborted"; return; }
+    [[ $ans == [yY]* ]] || { info "aborted"; return; }
 
     # Asked separately, and only when there is something to delete: removing
     # the host's files and removing the stored key are two different decisions,
@@ -813,7 +817,7 @@ cmd_rm() {
     if ((have_entry)); then
         ans=""
         read -rp "also delete the KeePassXC entry '$entry'? [y/N] " ans || ans=""
-        if [[ ${ans,,} == y* ]]; then drop_entry=1; fi
+        if [[ $ans == [yY]* ]]; then drop_entry=1; fi
     fi
 
     # Closed while the config still names it: ssh derives the socket path from
@@ -1441,7 +1445,8 @@ cmd_export() {
                 ((++skipped_nokey))
             fi
         done
-        names=("${left[@]}")
+        # Guarded as in kp_call: an empty array is unset to bash 3.2.
+        names=(${left[@]+"${left[@]}"})
         [[ ${#names[@]} -gt 0 ]] || die "nothing left to export ($(skip_note 0 $skipped_nokey))"
     fi
 
@@ -1534,7 +1539,7 @@ cmd_drop() {
     if [[ -n $vault_fp && $vault_fp == "$have" ]]; then
         info "fingerprints match -- reversible via 'skm restore $name $db'"
         read -rp "delete local private key for '$name'? [y/N] " ans || ans=""
-        [[ ${ans,,} == y* ]] || { info "aborted"; return; }
+        [[ $ans == [yY]* ]] || { info "aborted"; return; }
     else
         if [[ -z $vault_fp ]]; then
             info "DANGER: '$name' is not in KeePassXC under $entry -- deleting now loses the only copy"
@@ -1543,7 +1548,7 @@ cmd_drop() {
         fi
         ((force)) || die "refusing to delete (re-run with --force if you're sure)"
         read -rp "this cannot be undone -- really delete '$key'? [y/N] " ans || ans=""
-        [[ ${ans,,} == y* ]] || { info "aborted"; return; }
+        [[ $ans == [yY]* ]] || { info "aborted"; return; }
     fi
 
     # Before the private key goes, not after: rebuilding the public half needs
@@ -1629,7 +1634,7 @@ cmd_restore() {
             fi
             local ans=""
             read -rp "replace '$key' with the vault copy? [y/N] " ans || ans=""
-            [[ ${ans,,} == y* ]] || { wipe_tmp "$tmpdir"; info "aborted"; return; }
+            [[ $ans == [yY]* ]] || { wipe_tmp "$tmpdir"; info "aborted"; return; }
             local backup
             backup="$key.bak-$(date +%Y%m%dT%H%M%S)"
             mv "$key" "$backup"
@@ -1772,6 +1777,7 @@ cmd_scope() {
     # the run, and the agent goes with it.
     SKM_SCOPE_PENDING=$label
 
+    # Often left empty, so expanded with the guard kp_call explains.
     local flags=()
     ((confirm))    && flags+=(-c)
     [[ -n $ttl ]]  && flags+=(-t "$ttl")
@@ -1784,7 +1790,7 @@ cmd_scope() {
             # Said out loud rather than left to the exit status: a key the
             # agent turns down ends the scope, and the run says which key it
             # was and that nothing was left running.
-            ssh-add "${flags[@]}" "$key" || die "ssh-add would not take the key for '$n'"
+            ssh-add ${flags[@]+"${flags[@]}"} "$key" || die "ssh-add would not take the key for '$n'"
         else
             # The key lives in KeePassXC only. Where keepassxc-cli can write
             # an attachment to its standard output it goes straight down a
@@ -1799,7 +1805,7 @@ cmd_scope() {
             if kp_has_stdout; then
                 rc=0
                 kp_add_to_agent "$db" "$KP_GROUP/$n" \
-                    "$(basename "$key")" "${flags[@]}" || rc=$?
+                    "$(basename "$key")" ${flags[@]+"${flags[@]}"} || rc=$?
                 case $rc in
                     0) ;;
                     1) die "no key attachment for '$n' in $KP_GROUP/$n" ;;
@@ -1817,7 +1823,7 @@ cmd_scope() {
                     *) wipe_tmp "$tmp"; kp_die "could not read $db" ;;
                 esac
                 chmod 600 "$tmp/$n"
-                if ! ssh-add "${flags[@]}" "$tmp/$n"; then
+                if ! ssh-add ${flags[@]+"${flags[@]}"} "$tmp/$n"; then
                     wipe_tmp "$tmp"
                     die "ssh-add would not take the key for '$n'"
                 fi
