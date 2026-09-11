@@ -421,6 +421,70 @@ teardown() { skm_teardown; }
     assert_output_has "no key attachment"
 }
 
+@test "restore --force replaces a key the vault already holds without asking" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    local fp; fp=$(fingerprint "$(keyfile box)")
+
+    run skm_answer "$DB_PW" -- restore --force box "$DB"
+    assert_ok
+    assert_output_lacks "DANGER"
+    assert_equal "$(fingerprint "$(keyfile box)")" "$fp"
+}
+
+@test "restore --force will not quietly replace a key that is not the vault copy" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    # The state `skm rm` followed by `skm add` leaves: same name, different key.
+    rm -f "$(keyfile box)" "$(keyfile box).pub"
+    ssh-keygen -q -t ed25519 -N '' -C other -f "$(keyfile box)"
+    local fp; fp=$(fingerprint "$(keyfile box)")
+
+    run skm_answer "$DB_PW" -- restore --force box "$DB"
+    assert_ok
+    assert_output_has "fingerprints differ"
+    assert_output_has "aborted"
+    assert_equal "$(fingerprint "$(keyfile box)")" "$fp"
+}
+
+@test "restore --force keeps the displaced key beside the one it restored" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    local vault_fp; vault_fp=$(fingerprint "$(keyfile box)")
+    rm -f "$(keyfile box)" "$(keyfile box).pub"
+    ssh-keygen -q -t ed25519 -N '' -C other -f "$(keyfile box)"
+    local local_fp; local_fp=$(fingerprint "$(keyfile box)")
+
+    run skm_answer "$DB_PW" y -- restore --force box "$DB"
+    assert_ok
+    assert_output_has "kept the displaced key as"
+    assert_equal "$(fingerprint "$(keyfile box)")" "$vault_fp"
+
+    local backups=() f
+    for f in "$(keyfile box)".bak-*; do
+        case $f in *.pub) continue ;; esac
+        backups+=("$f")
+    done
+    assert_equal "${#backups[@]}" 1
+    assert_equal "$(fingerprint "${backups[0]}")" "$local_fp"
+    assert_file "${backups[0]}.pub"
+}
+
+@test "restore refuses an attachment that is not a key and leaves the host alone" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    skm_answer "$DB_PW" y -- drop box "$DB" >/dev/null
+    printf 'not a key\n' > "$SKM_TMP/junk"
+    printf '%s\n' "$DB_PW" | kp_cli attachment-import -f "$DB" "SSH Keys/box" \
+        "id_ed25519_box" "$SKM_TMP/junk" >/dev/null
+
+    run skm_answer "$DB_PW" -- restore box "$DB"
+    assert_fails
+    assert_output_has "not a readable private key"
+    assert_no_file "$(keyfile box)"
+    assert_equal "$(identity_file box)" "$(keyfile box).pub"
+}
+
 # ---------------------------------------------------------------- status
 
 @test "status reads the vault and confirms the two copies are the same key" {

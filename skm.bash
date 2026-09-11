@@ -1185,23 +1185,67 @@ cmd_restore() {
     kp_require
     kp_password "$db"
 
+    # Both halves come out into a private temp dir first. What an attachment
+    # holds is only a key if it parses as one, and something that doesn't must
+    # never reach the key's place on disk, nor have the host pointed at it.
+    local tmpdir; tmpdir=$(ramtemp)
     local rc=0
-    kp_attachment_export "$db" "$entry" "$base" "$key" || rc=$?
+    kp_attachment_export "$db" "$entry" "$base" "$tmpdir/$base" || rc=$?
     case $rc in
         0) ;;
-        1) die "no key attachment for '$name' in $entry" ;;
-        *) kp_die "could not read $db" ;;
+        1) rm -rf "$tmpdir"; die "no key attachment for '$name' in $entry" ;;
+        *) rm -rf "$tmpdir"; kp_die "could not read $db" ;;
     esac
-    chmod 600 "$key"
 
+    local vault_fp; vault_fp=$(key_fingerprint "$tmpdir/$base")
+    if [[ -z $vault_fp ]]; then
+        rm -rf "$tmpdir"
+        die "the key attachment in $entry is not a readable private key -- nothing on disk was changed"
+    fi
+
+    local have_pub=0
     rc=0
-    kp_attachment_export "$db" "$entry" "$base.pub" "$key.pub" || rc=$?
+    kp_attachment_export "$db" "$entry" "$base.pub" "$tmpdir/$base.pub" || rc=$?
     case $rc in
-        0) ;;
-        1) info "no public key attachment in $entry"
-           ensure_pub "$name" ;;
-        *) kp_die "could not read $db" ;;
+        0) have_pub=1 ;;
+        1) info "no public key attachment in $entry" ;;
+        *) rm -rf "$tmpdir"; kp_die "could not read $db" ;;
     esac
+
+    # A key on disk that isn't the vault copy is a second key, not a stale copy
+    # of this one: writing over it would destroy the only copy of it there is.
+    # --force alone replaces a key the vault already holds; a different key
+    # takes an answer as well, and is kept, dated, beside the restored one.
+    if [[ -f $key ]]; then
+        local have; have=$(key_fingerprint "$key")
+        if [[ $have != "$vault_fp" ]]; then
+            echo
+            info "local:  ${have:-(not a readable private key)}"
+            info "vault:  $vault_fp"
+            if [[ -z $have ]]; then
+                info "DANGER: the key on disk cannot be read, so it cannot be shown to be this one"
+            else
+                info "DANGER: fingerprints differ -- the key on disk is NOT the vault copy"
+            fi
+            local ans=""
+            read -rp "replace '$key' with the vault copy? [y/N] " ans || ans=""
+            [[ ${ans,,} == y* ]] || { rm -rf "$tmpdir"; info "aborted"; return; }
+            local backup
+            backup="$key.bak-$(date +%Y%m%dT%H%M%S)"
+            mv "$key" "$backup"
+            [[ -f $key.pub ]] && mv "$key.pub" "$backup.pub"
+            info "kept the displaced key as $backup"
+        fi
+    fi
+
+    mv "$tmpdir/$base" "$key"
+    chmod 600 "$key"
+    if ((have_pub)); then
+        mv "$tmpdir/$base.pub" "$key.pub"
+        chmod 600 "$key.pub"
+    fi
+    rm -rf "$tmpdir"
+    ((have_pub)) || ensure_pub "$name"
 
     retarget "$name" ondisk
 
