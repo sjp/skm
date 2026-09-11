@@ -599,11 +599,11 @@ teardown() { skm_teardown; }
 
 # ------------------------------------------------------------- provision
 
-@test "provision chains add, export, agent and drop into one key" {
-    # the answers, in order: ssh-keygen's empty passphrase twice, the vault
-    # password, "skip" past the agent check, the vault password again, and
-    # the confirmation for deleting the on-disk key
-    run skm_answer "" "" "$DB_PW" skip "$DB_PW" y -- provision box user@example.com "$DB"
+@test "provision chains add, export and drop into one key" {
+    # the answers, in order: the vault password, ssh-keygen's empty passphrase
+    # twice, "skip" past the agent check, and the confirmation for deleting
+    # the on-disk key
+    run skm_answer "$DB_PW" "" "" skip y -- provision box user@example.com "$DB"
     assert_ok
     assert_output_has "provisioned 'box'"
 
@@ -616,6 +616,99 @@ teardown() { skm_teardown; }
     run vault_attachments "SSH Keys/box"
     assert_output_has "id_ed25519_box"
     assert_output_has "KeeAgent.settings"
+}
+
+@test "provision opens the database once, before it generates anything" {
+    kp_shim_setup
+
+    PATH="$KP_SHIM:$PATH" skm_answer "$DB_PW" "" "" skip y \
+        -- provision box user@example.com "$DB" >/dev/null
+    # One password, proved once: export and drop reuse what provision opened.
+    assert_equal "$(kp_calls_of db-info)" 1
+}
+
+@test "a provision that cannot open the database leaves nothing on disk" {
+    run skm_answer "not the password" -- provision box user@example.com "$DB"
+    assert_fails
+    assert_output_has "wrong password"
+    assert_no_file "$(keyfile box)"
+    assert_no_file "$(conffile box)"
+}
+
+@test "provision finishes a host whose key never reached the vault" {
+    add_host box
+
+    run skm_answer "$DB_PW" skip y -- provision box user@example.com "$DB"
+    assert_ok
+    assert_output_has "already managed"
+    assert_output_has "provisioned 'box'"
+    assert_no_file "$(keyfile box)"
+    vault_entry_exists "SSH Keys/box"
+}
+
+@test "provision on a host that is already provisioned reports it and stops" {
+    skm_answer "$DB_PW" "" "" skip y -- provision box user@example.com "$DB" >/dev/null
+
+    run skm_answer "$DB_PW" -- provision box user@example.com "$DB"
+    assert_ok
+    assert_output_has "already in 'SSH Keys/box' and off disk"
+    assert_output_has "provisioned 'box'"
+    assert_no_file "$(keyfile box)"
+    assert_equal "$(identity_file box)" "$(keyfile box).pub"
+}
+
+@test "provision that is told not to delete leaves an on-disk host and says so" {
+    run skm_answer "$DB_PW" "" "" skip n -- provision box user@example.com "$DB"
+    assert_ok
+    assert_output_has "still on disk"
+    assert_output_lacks "provisioned 'box'"
+    assert_file "$(keyfile box)"
+    assert_equal "$(identity_file box)" "$(keyfile box)"
+
+    # and running it again finishes the job
+    run skm_answer "$DB_PW" skip y -- provision box user@example.com "$DB"
+    assert_ok
+    assert_output_has "already stored"
+    assert_output_has "provisioned 'box'"
+    assert_no_file "$(keyfile box)"
+    assert_equal "$(identity_file box)" "$(keyfile box).pub"
+}
+
+@test "provision stops when the vault holds a different key under that name" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+
+    # a new key under the same name: the stored one is no longer this key
+    rm -f "$(keyfile box)" "$(keyfile box).pub"
+    ssh-keygen -q -t ed25519 -N '' -f "$(keyfile box)"
+
+    run skm_answer "$DB_PW" skip y -- provision box user@example.com "$DB"
+    assert_fails
+    assert_output_has "already in KeePassXC under a different key"
+    assert_file "$(keyfile box)"
+}
+
+@test "provision refuses a managed name that points somewhere else" {
+    add_host box user@example.com
+
+    run skm_answer "$DB_PW" -- provision box user@other.example.com "$DB"
+    assert_fails
+    assert_output_has "points at user@example.com:22"
+}
+
+@test "provision warns about a database KeePassXC has open" {
+    touch "$DB.lock"
+    run skm_answer "$DB_PW" "" "" skip y -- provision box user@example.com "$DB"
+    assert_ok
+    assert_output_has "looks open in KeePassXC"
+    assert_no_file "$(keyfile box)"      # warned about, not stopped by
+
+    # the same file, hidden, is the other spelling of it
+    rm -f "$DB.lock"
+    touch "$(dirname "$DB")/.$(basename "$DB").lock"
+    run skm_answer "$DB_PW" "" "" skip y -- provision tin user@example.com "$DB"
+    assert_ok
+    assert_output_has "looks open in KeePassXC"
 }
 
 @test "provision needs a name, a destination and a database that exists" {

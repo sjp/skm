@@ -6,7 +6,8 @@
 #
 #   skm add <name> <user@host> [port]   generate key + config entry
 #   skm provision <name> <user@host> [port] <db.kdbx>
-#                                      add + export + agent + drop, in one go
+#                                      add + export + drop, in one go; re-run
+#                                      it to finish a run that stopped early
 #   skm alias <name> <pattern>...       let more names/IPs/globs use this key
 #   skm list                            show managed hosts
 #   skm status [name|--all] [db.kdbx]   show where each key's private/public half lives
@@ -320,9 +321,14 @@ EOF
 }
 
 # The ideal end state for a new key: config + public key on disk, private key
-# only in KeePassXC. This chains the four manual steps (add, export, agent,
+# only in KeePassXC. This chains the three steps that get there (add, export,
 # drop) and, since drop's deletion is irreversible if the agent isn't actually
 # serving the key yet, pauses to verify the key is loaded before deleting it.
+#
+# Every step is skipped when its work is already done, so the way to recover
+# from a run that stopped half way -- a mistyped password, a database that
+# would not open, a deletion left unconfirmed -- is to run the same command
+# again. What is already on disk and in the database decides where it resumes.
 cmd_provision() {
     local usage="usage: skm provision <name> <user@host> [port] <database.kdbx>"
     local name=${1:-} dest=${2:-} port=22 db=""
@@ -332,15 +338,85 @@ cmd_provision() {
         *) die "$usage" ;;
     esac
     [[ -n $name && -n $dest && -n $db ]] || die "$usage"
+    [[ $dest == *@* ]] || die "destination must be user@host, e.g. git@github.com"
+    require_name "$name"
+    require_port "$port"
     [[ -f $db ]] || die "no such database: $db"
 
-    cmd_add    "$name" "$dest" "$port"
-    cmd_export "$name" "$db"
-    cmd_agent  "$name"
-
     local key; key=$(keyfile "$name")
-    local fp;  fp=$(key_fingerprint "$key")
+    local conf; conf=$(conffile "$name")
+    local entry="$KP_GROUP/$name"
+
+    # The database is opened before a key is generated, because a run that
+    # cannot reach the vault has nowhere to put one: a missing keepassxc-cli
+    # or a wrong password stops it here, with nothing on disk to explain. It
+    # is opened once; the steps below reuse that password rather than asking
+    # for it again.
+    kp_require
+    warn_db_open "$db"
+    kp_password "$db"
+
+    local rc=0 stored=0
+    kp_entry_exists "$db" "$entry" || rc=$?
+    case $rc in
+        0) stored=1 ;;
+        1) stored=0 ;;
+        *) kp_die "could not read $db" ;;
+    esac
+
+    if [[ -e $conf ]]; then
+        # Resuming means continuing with the host that is already there, so a
+        # destination that isn't the one it points at is a different host
+        # wearing the same name -- and picking one of the two silently is how
+        # a key ends up provisioned for somewhere nobody asked about.
+        local have
+        have=$(awk '$1=="User"{u=$2} $1=="HostName"{h=$2} $1=="Port"{p=$2} \
+                    END{printf "%s@%s:%s", u, h, (p==""?"22":p)}' "$conf")
+        [[ $have == "$dest:$port" ]] || \
+            die "'$name' is already managed and points at $have, not $dest:$port"
+        info "'$name' is already managed; carrying on from there"
+    elif [[ -e $key ]]; then
+        die "there is already a key at $key but no config for '$name' -- move that key aside, or provision under another name"
+    elif ((stored)); then
+        die "'$name' is already in KeePassXC under '$entry', with nothing for it on disk -- 'skm restore $name $db' brings it back, or provision under another name"
+    else
+        cmd_add "$name" "$dest" "$port"
+    fi
+
+    local fp=""
+    if [[ ! -f $key ]]; then
+        # Nothing left to export or delete: the private key is where this
+        # command was going to put it. All that can be missing is the config
+        # pointing at the public half, which is what ssh needs to ask the
+        # agent for the private one.
+        info "the private key for '$name' is already in '$entry' and off disk"
+        if [[ $(identity_of "$conf") != *.pub ]]; then
+            retarget "$name" agent
+            info "$name now resolves its key via the ssh-agent"
+        fi
+        echo
+        info "provisioned '$name': config + public key on disk, private key in KeePassXC only"
+        return
+    fi
+
+    fp=$(key_fingerprint "$key")
     [[ -n $fp ]] || die "could not read local key: $key"
+
+    if ((stored)); then
+        rc=0
+        vault_fingerprint "$db" "$name" || rc=$?
+        ((rc <= 1)) || kp_die "could not read $db"
+        if [[ $VAULT_FP == "$fp" ]]; then
+            info "'$name' is already stored in '$entry'"
+        else
+            echo
+            info "local:  $fp"
+            info "vault:  ${VAULT_FP:-(nothing attached to that entry)}"
+            die "'$name' is already in KeePassXC under a different key -- 'skm export --force $name $db' replaces it"
+        fi
+    else
+        cmd_export "$name" "$db"
+    fi
 
     echo
     info "before the on-disk private key can be deleted, KeePassXC must be serving it:"
@@ -362,10 +438,19 @@ cmd_provision() {
         info "agent does not list $fp yet -- unlock KeePassXC and try again"
     done
 
+    # drop points the config at the public key itself, once the private key is
+    # gone. Declining its confirmation therefore leaves an ordinary on-disk
+    # host, which works as it stands -- and saying so is the whole report,
+    # since the key this command set out to move is still sitting on disk.
     cmd_drop "$name" "$db"
 
     echo
-    info "provisioned '$name': config + public key on disk, private key in KeePassXC only"
+    if [[ -f $key ]]; then
+        info "'$name' is stored in KeePassXC, but its private key is still on disk and the config still reads it from there"
+        info "finish with:  skm drop $name $db"
+    else
+        info "provisioned '$name': config + public key on disk, private key in KeePassXC only"
+    fi
 }
 
 # `Host` takes a list of patterns, so extra domains / IPs / globs can share a
@@ -706,7 +791,6 @@ cmd_rm() {
         run_kp rm "$db" "$entry" || kp_die "could not remove '$entry' from $db"
         info "removed entry '$entry'"
     fi
-    KP_PW=""
 
     # The private key gets the same treatment it would get from `drop`: there
     # is no sense in overwriting a key when it moves into the vault but not
@@ -783,8 +867,12 @@ cmd_ondisk() {
 
 # The binary and the database password, settled once per run and shared by
 # every vault call below. Commands that never open a vault leave both empty.
+# KP_PW_DB names the database the held password was proved against, which is
+# what lets a command that opens the same database a second time reuse it
+# instead of asking again.
 KP_CLI=""
 KP_PW=""
+KP_PW_DB=""
 
 # The passphrase of the key currently being exported, for as long as that
 # takes. Empty for a key that has none.
@@ -918,6 +1006,24 @@ kp_absent() {
     [[ $KP_ERR == *'Could not find'* ]]
 }
 
+# KeePassXC leaves a lock file beside a database it has open. keepassxc-cli
+# writes to the database regardless of that file, but the open GUI is holding
+# its own copy of the database in memory, and saving that copy writes back
+# everything it knew -- which is the database as it was before skm touched it.
+# Versions differ over whether the lock file is hidden, so both spellings
+# count.
+warn_db_open() {   # db
+    local db=$1 dir lock
+    dir=$(dirname "$db")
+    for lock in "$db.lock" "$dir/.$(basename "$db").lock"; do
+        [[ -e $lock ]] || continue
+        warn "$db looks open in KeePassXC ($lock)"
+        warn "close or lock it there first, or its next save may put back the database as it was"
+        return 0
+    done
+    return 0
+}
+
 # Ask for the database password and prove it opens the database before any
 # command acts on what the database appears to say. An unchecked password is
 # indistinguishable from an empty vault, and an empty vault is what makes
@@ -925,12 +1031,17 @@ kp_absent() {
 kp_password() {   # db
     local db=$1 tries=1 i
 
+    # Whatever opens this database was proved against it already, earlier in
+    # the same run. A command chain that opens it twice -- exporting a key and
+    # then deleting the on-disk copy -- asks its one question once.
+    [[ -n $KP_PW_DB && $KP_PW_DB == "$db" ]] && return 0
+
     # A database with no password of its own has nothing to ask for: the key
     # file or the hardware key is the whole credential. It still has to be
     # proved, for the same reason a password does.
     if (( KP_NO_PW )); then
         KP_PW=""
-        if run_kp db-info "$db"; then return 0; fi
+        if run_kp db-info "$db"; then KP_PW_DB=$db; return 0; fi
         kp_die "could not open $db"
     fi
 
@@ -940,7 +1051,7 @@ kp_password() {   # db
     if [[ -n $KP_PW_FILE ]]; then
         [[ -f $KP_PW_FILE ]] || die "no such KeePassXC password file: $KP_PW_FILE"
         KP_PW=$(head -n 1 "$KP_PW_FILE")
-        if run_kp db-info "$db"; then return 0; fi
+        if run_kp db-info "$db"; then KP_PW_DB=$db; return 0; fi
         KP_PW=""
         if [[ $KP_ERR == *'Invalid credentials'* ]]; then
             die "wrong password for $db (read from $KP_PW_FILE)"
@@ -953,6 +1064,7 @@ kp_password() {   # db
         read -rsp "KeePassXC database password: " KP_PW || die "no password given"
         echo   # -s ate the newline
         if run_kp db-info "$db"; then
+            KP_PW_DB=$db
             return 0
         fi
         KP_PW=""
@@ -1034,6 +1146,27 @@ kp_add_to_agent() {   # db entry attachment ssh-add-flag...
 # match. Works on a private key without its passphrase.
 key_fingerprint() {   # file -> "SHA256:..."  (prints nothing on failure)
     ssh-keygen -lf "$1" 2>/dev/null | awk '{print $2}' || true
+}
+
+# Which key an entry is actually holding, judged from the stored copy rather
+# than from anything the entry says about itself. The copy is taken into the
+# run's own temporary directory and wiped again before the answer is given.
+# The answer lands in a variable because a caller reading it through $( )
+# would run this -- and so create the temporary directory -- in a subshell,
+# leaving the directory behind when that subshell ends.
+#
+#   0  VAULT_FP is the fingerprint      1  no key attached to that entry
+#   2  the database could not be read; KP_ERR says why
+VAULT_FP=""
+vault_fingerprint() {   # db name -> sets VAULT_FP
+    local db=$1 name=$2 rc=0 base
+    base=$(basename "$(keyfile "$name")")
+    VAULT_FP=""
+    ramtemp
+    kp_attachment_export "$db" "$KP_GROUP/$name" "$base" "$SKM_TMPSUB/$base" || rc=$?
+    ((rc == 0)) && VAULT_FP=$(key_fingerprint "$SKM_TMPSUB/$base")
+    wipe_tmp "$SKM_TMPSUB"
+    return "$rc"
 }
 
 # What decrypts a key: nothing at all, or a passphrase only the user knows.
@@ -1126,10 +1259,14 @@ SKM_SCOPE_PENDING=""
 # two there is a passphrase to mistype, a prompt to answer wrongly and a
 # Ctrl-C to hit, and each of those ends the run somewhere other than the line
 # that cleans up -- so the cleanup hangs on the way out instead, which is the
-# one place all of them go through.
+# one place all of them go through. The database password is dropped here for
+# the same reason, and here rather than at the end of each command, because a
+# run is free to open the same database again before it is over.
 skm_cleanup() {
     wipe_tmp "$SKM_TMPDIR"
     SKM_TMPDIR=""
+    KP_PW=""
+    KP_PW_DB=""
     if [[ -n $SKM_SCOPE_PENDING ]]; then
         local label=$SKM_SCOPE_PENDING
         SKM_SCOPE_PENDING=""
@@ -1297,7 +1434,6 @@ cmd_export() {
 
     local i
     for i in "${!todo[@]}"; do export_one "${todo[i]}" "$db" "${stored[i]}"; done
-    KP_PW=""
 
     # Reached only with at least one key written, so the advice below always
     # has something to be about.
@@ -1330,7 +1466,7 @@ cmd_drop() {
     local key; key=$(keyfile "$name")
     [[ -f $key ]] || die "no local private key for '$name' (already dropped?)"
 
-    local entry="$KP_GROUP/$name" base; base=$(basename "$key")
+    local entry="$KP_GROUP/$name"
 
     kp_require
     kp_password "$db"
@@ -1338,15 +1474,10 @@ cmd_drop() {
     local have; have=$(key_fingerprint "$key")
     [[ -n $have ]] || die "could not read local key: $key"
 
-    ramtemp; local tmpdir=$SKM_TMPSUB
-    local vault_key="$tmpdir/$base" vault_fp="" rc=0
-    kp_attachment_export "$db" "$entry" "$base" "$vault_key" || rc=$?
-    case $rc in
-        0) vault_fp=$(key_fingerprint "$vault_key") ;;
-        1) ;;   # the key really isn't stored under this entry
-        *) wipe_tmp "$tmpdir"; kp_die "could not read $db" ;;
-    esac
-    wipe_tmp "$tmpdir"
+    local rc=0
+    vault_fingerprint "$db" "$name" || rc=$?
+    ((rc <= 1)) || kp_die "could not read $db"   # 1 = not stored under this entry
+    local vault_fp=$VAULT_FP
 
     echo
     info "local:  $have"
@@ -1698,7 +1829,7 @@ cmd_unscope() {
 
 # The command summary at the top of this file is the help text; printing it
 # from there keeps the two from drifting apart.
-usage() { sed -n '3,33p' "$0" | sed 's/^# \?//'; }
+usage() { sed -n '3,34p' "$0" | sed 's/^# \?//'; }
 
 case "${1:-help}" in
     add)       shift; cmd_add       "$@" ;;
