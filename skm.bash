@@ -985,6 +985,16 @@ export_one() {
     KEY_PASS=""
 }
 
+# The reasons a run stepped over a host, gathered into one phrase for the count
+# at the end: "2 already in KeePassXC, 1 with no private key on disk". Empty
+# when nothing was skipped.
+skip_note() {   # already-stored-count no-key-count
+    local note=""
+    if (($1 > 0)); then note="$1 already in KeePassXC"; fi
+    if (($2 > 0)); then note="${note:+$note, }$2 with no private key on disk"; fi
+    printf '%s\n' "$note"
+}
+
 cmd_export() {
     local force=0 args=()
     while [[ $# -gt 0 ]]; do
@@ -999,8 +1009,9 @@ cmd_export() {
     [[ -n $what && -n $db ]] || die "usage: skm export [--force] <name|--all> <database.kdbx>"
     [[ -f $db ]] || die "no such database: $db"
 
-    local names=()
+    local all=0 names=()
     if [[ $what == --all ]]; then
+        all=1
         shopt -s nullglob
         for f in "$CONF_DIR"/*.conf; do names+=("$(basename "$f" .conf)"); done
         [[ ${#names[@]} -gt 0 ]] || die "nothing managed to export"
@@ -1009,23 +1020,54 @@ cmd_export() {
     fi
 
     kp_require
+
+    # A run over every host is expected to meet hosts that are already dealt
+    # with: one whose private key was moved into the database has nothing left
+    # on disk to store. Stepping over it, rather than stopping, is what lets
+    # the hosts after it have their turn. Asked for by name it stays an error,
+    # because then it is the one thing that was asked for.
+    local n skipped_nokey=0 skipped_stored=0
+    if ((all)); then
+        local left=()
+        for n in "${names[@]}"; do
+            if [[ -f $(keyfile "$n") ]]; then
+                left+=("$n")
+            else
+                info "skipping $n (no private key on disk)"
+                ((++skipped_nokey))
+            fi
+        done
+        names=("${left[@]}")
+        [[ ${#names[@]} -gt 0 ]] || die "nothing left to export ($(skip_note 0 $skipped_nokey))"
+    fi
+
     kp_password "$db"
 
     # One lookup per name, before anything is written: it says which entries a
     # plain export would overwrite, and it saves every export the `add` that a
-    # name already in the database doesn't need.
-    local n rc stored=() existing=()
+    # name already in the database doesn't need. Over every host, an entry that
+    # is already there is left alone unless --force asks for it to be rewritten
+    # -- otherwise the second run of --all could never get past the first key
+    # the first run stored.
+    local rc todo=() stored=()
     for n in "${names[@]}"; do
         rc=0
         kp_entry_exists "$db" "$KP_GROUP/$n" || rc=$?
         case $rc in
-            0) stored+=(1); existing+=("$n") ;;
-            1) stored+=(0) ;;
-            *) kp_die "could not read $db" ;;
+            0)  if ((force)); then
+                    todo+=("$n"); stored+=(1)
+                elif ((all)); then
+                    info "skipping $n (already in KeePassXC; --force to overwrite)"
+                    ((++skipped_stored))
+                else
+                    die "already in KeePassXC: $n  (re-run with --force to overwrite)"
+                fi ;;
+            1)  todo+=("$n"); stored+=(0) ;;
+            *)  kp_die "could not read $db" ;;
         esac
     done
-    ((force)) || [[ ${#existing[@]} -eq 0 ]] || \
-        die "already in KeePassXC: ${existing[*]}  (re-run with --force to overwrite)"
+    [[ ${#todo[@]} -gt 0 ]] || \
+        die "nothing left to export ($(skip_note $skipped_stored $skipped_nokey))"
 
     # The group holds every exported key, so it is created once for the run
     # rather than once per key. From the second run on "already exists" is the
@@ -1034,10 +1076,16 @@ cmd_export() {
         || kp_die "could not create group '$KP_GROUP' in $db"
 
     local i
-    for i in "${!names[@]}"; do export_one "${names[i]}" "$db" "${stored[i]}"; done
+    for i in "${!todo[@]}"; do export_one "${todo[i]}" "$db" "${stored[i]}"; done
     KP_PW=""
 
+    # Reached only with at least one key written, so the advice below always
+    # has something to be about.
     echo
+    if ((all)); then
+        local note; note=$(skip_note $skipped_stored $skipped_nokey)
+        info "exported ${#todo[@]}, skipped $((skipped_stored + skipped_nokey))${note:+ ($note)}"
+    fi
     info "next: in KeePassXC, enable Tools > Settings > SSH Agent, then re-unlock the database."
     info "each entry's Password field holds that key's passphrase, which is what decrypts it."
     info "verify with 'ssh-add -l', then run 'skm agent <name>' and delete the on-disk key."

@@ -71,6 +71,75 @@ teardown() { skm_teardown; }
     assert_output_has "id_ed25519_tin"
 }
 
+@test "export --all steps over a host whose key is already in the vault only" {
+    add_host box
+    add_host tin
+    rm -f "$(keyfile tin)"          # tin's private key lives in the vault now
+
+    run skm_answer "$DB_PW" -- export --all "$DB"
+    assert_ok
+    assert_output_has "skipping tin (no private key on disk)"
+    assert_output_has "exported box"
+    assert_output_has "exported 1, skipped 1 (1 with no private key on disk)"
+
+    run vault_attachments "SSH Keys/box"
+    assert_output_has "id_ed25519_box"
+}
+
+@test "export --all leaves stored entries alone and exports the rest" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    add_host tin
+
+    run skm_answer "$DB_PW" -- export --all "$DB"
+    assert_ok
+    assert_output_has "skipping box (already in KeePassXC"
+    assert_output_has "exported tin"
+    assert_output_has "exported 1, skipped 1 (1 already in KeePassXC)"
+
+    run vault_attachments "SSH Keys/tin"
+    assert_output_has "id_ed25519_tin"
+}
+
+@test "export --force --all refreshes every host that still has a key" {
+    add_host box
+    add_host tin
+    skm_answer "$DB_PW" -- export --all "$DB" >/dev/null
+    rm -f "$(keyfile tin)"
+
+    # a different key under the same name: --force must reach it even though
+    # the host listed before it had nothing to store
+    rm -f "$(keyfile box)" "$(keyfile box).pub"
+    ssh-keygen -q -t ed25519 -N '' -f "$(keyfile box)" -C replacement
+
+    run skm_answer "$DB_PW" -- export --force --all "$DB"
+    assert_ok
+    assert_output_has "skipping tin (no private key on disk)"
+    assert_output_has "exported 1, skipped 1"
+
+    vault_export_key box "$SKM_TMP/from-vault"
+    assert_equal "$(fingerprint "$SKM_TMP/from-vault")" "$(fingerprint "$(keyfile box)")"
+}
+
+@test "export --all fails when there is nothing left to export" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+
+    run skm_answer "$DB_PW" -- export --all "$DB"
+    assert_fails
+    assert_output_has "nothing left to export"
+    assert_output_has "1 already in KeePassXC"
+}
+
+@test "export of a named host still refuses when its key is gone" {
+    add_host box
+    rm -f "$(keyfile box)"
+
+    run skm_answer "$DB_PW" -- export box "$DB"
+    assert_fails
+    assert_output_has "no private key on disk"
+}
+
 @test "export needs a managed host, an existing database and both arguments" {
     add_host box
 
