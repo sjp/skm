@@ -14,6 +14,13 @@ agent_fingerprints() {
     SSH_AUTH_SOCK=$(sock_for "$1") ssh-add -l 2>/dev/null | awk '{print $2}'
 }
 
+# A label that failed should have left nothing an agent could answer on, and
+# no pid file for a later run to read a number out of.
+assert_no_scope() {
+    assert_no_file "$(sock_for "$1")"
+    assert_no_file "$SSH_DIR/agents/$1.pid"
+}
+
 @test "scope starts an agent holding exactly the named key" {
     add_host box
     add_host tin
@@ -105,6 +112,28 @@ agent_fingerprints() {
     run skm scope work nosuch
     assert_fails
     assert_output_has "no such managed host"
+}
+
+@test "one unmanaged name stops the scope before any agent is started" {
+    add_host box
+
+    run skm scope work box nosuch
+    assert_fails
+    assert_output_has "no such managed host"
+
+    assert_no_scope work
+}
+
+@test "a key the agent will not take takes the half-built scope with it" {
+    add_host box
+    add_host tin
+
+    refusing_ssh_add
+    PATH="$REFUSE_BIN:$PATH" run skm scope work box tin
+    assert_fails
+    assert_output_has "would not take the key for 'box'"
+
+    assert_no_scope work
 }
 
 @test "scope rejects an unknown flag" {
@@ -216,6 +245,35 @@ agent_fingerprints() {
 }
 
 # --------------------------------------------------------------------- rm
+
+@test "a vault key that was never stored takes the scope down with it" {
+    require_keepassxc
+    make_vault
+    add_host box
+    add_host tin
+    rm -f "$(keyfile tin)"          # vault-only, but nothing ever put it there
+
+    run skm_answer "$DB_PW" -- scope work -d "$DB" box tin
+    assert_fails
+    assert_output_has "no key attachment for 'tin'"
+
+    assert_no_scope work
+    assert_no_extracted_keys
+}
+
+@test "a database that will not open stops the scope before any agent starts" {
+    require_keepassxc
+    make_vault
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+    skm_answer "$DB_PW" y -- drop box "$DB" >/dev/null
+
+    run skm_answer wrong -- scope work -d "$DB" box
+    assert_fails
+    assert_output_has "wrong password"
+
+    assert_no_scope work
+}
 
 @test "rm names the scoped agents that are still holding the key" {
     add_host box

@@ -1124,6 +1124,13 @@ wipe_tmp() {   # dir
     rm -rf "$d"
 }
 
+# A scope is built in two moves -- start the agent, then fill it -- and until
+# the second one finishes there is an agent up holding part of a set of keys.
+# The label sits here between the two, so that a run which ends before the
+# scope is complete takes that agent down on its way out rather than leaving a
+# socket behind that answers with half of what was asked for.
+typeset -g SKM_SCOPE_PENDING=""
+
 # An extracted key must not outlive the command that extracted it. Between the
 # two there is a passphrase to mistype, a prompt to answer wrongly and a
 # Ctrl-C to hit, and each of those ends the run somewhere other than the line
@@ -1132,6 +1139,12 @@ wipe_tmp() {   # dir
 skm_cleanup() {
     wipe_tmp "$SKM_TMPDIR"
     SKM_TMPDIR=""
+    if [[ -n $SKM_SCOPE_PENDING ]]; then
+        local label=$SKM_SCOPE_PENDING
+        SKM_SCOPE_PENDING=""
+        kill_scope "$label" >/dev/null 2>&1 || true
+        warn "scope '$label' was not completed; its agent has been shut down"
+    fi
 }
 trap 'skm_cleanup' EXIT
 trap 'skm_cleanup; exit 130' INT
@@ -1575,6 +1588,31 @@ cmd_scope() {
     done
     (( ${#names} > 0 )) || die "name at least one key to put in the agent"
 
+    # Everything that can be settled without an agent is settled before there
+    # is one. A name that turns out not to be managed, a key that is in
+    # neither place it could be, a database that will not open -- each of them
+    # ends the run, and ending it here costs nothing, where ending it once the
+    # agent is up leaves a live socket holding part of what was asked for.
+    local n key vault=0
+    for n in "${names[@]}"; do
+        require_host "$n"
+        key=$(keyfile "$n")
+        if [[ ! -f $key ]]; then
+            [[ -n $db ]] \
+                || die "no key on disk for '$n' — pass -d <db.kdbx> to pull it from KeePassXC"
+            vault=1
+        fi
+    done
+
+    # The database is opened the once, however many keys come out of it, and
+    # by the same route as everywhere else: whatever unlocks it -- key file,
+    # hardware key, password -- works here too. Asking now also means the
+    # password prompt comes before the agent exists rather than after.
+    if (( vault )); then
+        kp_require
+        kp_password "$db"
+    fi
+
     mkdir -p "$SOCK_DIR"; chmod 700 "$SOCK_DIR"
     local sock="$SOCK_DIR/$label.sock"
 
@@ -1593,33 +1631,32 @@ cmd_scope() {
     export SSH_AUTH_SOCK="$sock"
     print -r -- "${SSH_AGENT_PID:-}" > "$SOCK_DIR/$label.pid"
 
+    # From here to the last key loaded, the scope is half-built: a passphrase
+    # typed wrongly, an entry that isn't there, a Ctrl-C at the prompt all end
+    # the run, and the agent goes with it.
+    SKM_SCOPE_PENDING=$label
+
     # An empty array expands to zero words here — no bash-3.2-style landmine.
     local -a flags=()
     (( confirm ))   && flags+=(-c)
     [[ -n $ttl ]]   && flags+=(-t "$ttl")
 
-    local n key tmp rc unlocked=0
+    local tmp rc
     for n in "${names[@]}"; do
-        require_host "$n"
         key=$(keyfile "$n")
 
         if [[ -f $key ]]; then
-            ssh-add "${flags[@]}" "$key"
-        elif [[ -n $db ]]; then
+            # Said out loud rather than left to the exit status: a key the
+            # agent turns down ends the scope, and the run says which key it
+            # was and that nothing was left running.
+            ssh-add "${flags[@]}" "$key" || die "ssh-add would not take the key for '$n'"
+        else
             # The key lives in KeePassXC only. Where keepassxc-cli can write
             # an attachment to its standard output it goes straight down a
             # pipe into the agent and is never a file at all; where it cannot,
             # it comes out into the run's own directory, which is memory where
             # the platform has any and is wiped however the run ends.
             #
-            # The database is opened the once, however many keys come out of
-            # it, and by the same route as everywhere else: whatever unlocks
-            # it -- key file, hardware key, password -- works here too.
-            if (( ! unlocked )); then
-                kp_require
-                kp_password "$db"
-                unlocked=1
-            fi
             # Said before the agent asks for anything: a key that arrives down
             # a pipe has no file name for ssh-add to name in its passphrase
             # prompt, and "(stdin)" tells nobody which key is being asked for.
@@ -1649,10 +1686,12 @@ cmd_scope() {
                 fi
                 wipe_tmp "$tmp"
             fi
-        else
-            die "no key on disk for '$n' — pass -d <db.kdbx> to pull it from KeePassXC"
         fi
     done
+
+    # Every key asked for is in: the scope is whole, and no longer something
+    # the way out has to clear up.
+    SKM_SCOPE_PENDING=""
 
     print
     info "scope '$label' is live at $sock"
