@@ -172,3 +172,35 @@ agent_fingerprints() {
     assert_ok
     assert_equal "$(agent_fingerprints work)" "$fp"
 }
+
+# --------------------------------------------------------------------- rm
+
+@test "rm names the scoped agents that are still holding the key" {
+    add_host box
+    skm scope work box >/dev/null
+
+    run skm_answer y -- rm box
+    assert_ok
+    assert_output_has "still loaded in scoped agent(s): work"
+    assert_output_has "skm unscope"
+}
+
+@test "rm finds the agents holding a key whose private half is already off disk" {
+    add_host box
+    skm scope work box >/dev/null
+    rm -f "$(keyfile box)"   # as drop leaves it: the public half and the agent
+
+    run skm_answer y -- rm box
+    assert_ok
+    assert_output_has "still loaded in scoped agent(s): work"
+}
+
+@test "rm says nothing about a scope that holds other keys" {
+    add_host box
+    add_host tin
+    skm scope work tin >/dev/null
+
+    run skm_answer y -- rm box
+    assert_ok
+    assert_output_lacks "still loaded"
+}

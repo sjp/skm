@@ -12,7 +12,7 @@
 #   skm status [name|--all] [db.kdbx]   show where each key's private/public half lives
 #   skm show <name>                     print the public key
 #   skm copy <name>                     ssh-copy-id the key to the server
-#   skm rm <name>                       delete key + config entry
+#   skm rm <name> [db.kdbx]             delete key + config (+ vault entry)
 #   skm export [--force] <name|--all> <db.kdbx>
 #                                      import key into KeePassXC as an agent key
 #   skm drop [--force] <name> <db.kdbx> remove local key (fingerprint-verified)
@@ -605,18 +605,122 @@ cmd_copy() {
     ssh-copy-id -i "$(keyfile "$name").pub" "$name"
 }
 
+# Which running scoped agents are holding a given key. An agent keeps its own
+# copy of everything loaded into it, so a key taken off disk stays usable
+# through every scope that already has it, for as long as that agent lives.
+scopes_holding() {   # fingerprint -> sets SCOPE_HOLDERS
+    SCOPE_HOLDERS=()
+    local fp=$1 s
+    [[ -n $fp && -d $SOCK_DIR ]] || return 0
+    shopt -s nullglob
+    for s in "$SOCK_DIR"/*.sock; do
+        if SSH_AUTH_SOCK="$s" ssh-add -l 2>/dev/null | grep -qF -- "$fp"; then
+            SCOPE_HOLDERS+=("$(basename "$s" .sock)")
+        fi
+    done
+    return 0
+}
+
+# Take a host apart: the key, its public half, the config fragment, and -- with
+# a database named -- the vault entry as well. Everything the key was reachable
+# through is closed on the way out, since a key nobody can delete is only half
+# removed: a live multiplexed connection, a scoped agent, an entry that puts the
+# key back in the agent at the next unlock.
 cmd_rm() {
-    local name=${1:-}
-    require_host "$name" "usage: skm rm <name>"
+    local usage="usage: skm rm <name> [database.kdbx]"
+    local name=${1:-} db=${2:-}
+    require_host "$name" "$usage"
+    [[ -z $db || -f $db ]] || die "no such database: $db"
+
+    local key; key=$(keyfile "$name")
+    local entry="$KP_GROUP/$name"
+
+    # The fingerprint is read while the key is still here, because afterwards
+    # there is nothing left to tell which agent holds this key rather than some
+    # other. In agent mode the private half has already gone and the public one
+    # answers the same question.
+    local fp=""
+    if   [[ -f $key ]];     then fp=$(key_fingerprint "$key")
+    elif [[ -f $key.pub ]]; then fp=$(key_fingerprint "$key.pub")
+    fi
+
+    # Where the vault stands is worth knowing before the question is asked:
+    # with the entry there this is a deletion of the local copy, without it
+    # this is the last copy of the key.
+    local have_entry=0 rc=0 shown=0
+    if [[ -n $db ]]; then
+        kp_require
+        kp_password "$db"
+        kp_entry_exists "$db" "$entry" || rc=$?
+        case $rc in
+            0) have_entry=1 ;;
+            1) ;;
+            *) kp_die "could not read $db" ;;
+        esac
+        echo
+        shown=1
+        if ((have_entry)); then
+            info "vault:  '$entry' is in $db"
+        else
+            info "vault:  no entry '$entry' in $db"
+        fi
+    fi
+
+    scopes_holding "$fp"
+    if [[ ${#SCOPE_HOLDERS[@]} -gt 0 ]]; then
+        local s list=""
+        for s in "${SCOPE_HOLDERS[@]}"; do list="${list:+$list, }$s"; done
+        echo
+        shown=1
+        info "still loaded in scoped agent(s): $list"
+        info "each keeps serving this key until it is killed: skm unscope <label>"
+    fi
 
     # The `||` matters: at EOF (piped or non-interactive input) read returns
     # non-zero, which under `set -e` would otherwise kill the script mid-way
     # with no explanation.
     local ans=""
+    if ((shown)); then echo; fi
     read -rp "delete key and config for '$name'? [y/N] " ans || ans=""
     [[ ${ans,,} == y* ]] || { info "aborted"; return; }
-    rm -f "$(conffile "$name")" "$(keyfile "$name")" "$(keyfile "$name").pub"
+
+    # Asked separately, and only when there is something to delete: removing
+    # the host's files and removing the stored key are two different decisions,
+    # and the second one is the irreversible half.
+    local drop_entry=0
+    if ((have_entry)); then
+        ans=""
+        read -rp "also delete the KeePassXC entry '$entry'? [y/N] " ans || ans=""
+        if [[ ${ans,,} == y* ]]; then drop_entry=1; fi
+    fi
+
+    # Closed while the config still names it: ssh derives the socket path from
+    # the fragment, so once that is gone it can no longer be asked to shut the
+    # master down, and the authenticated connection would stay usable for the
+    # rest of its ControlPersist time.
+    ssh -O exit "$name" >/dev/null 2>&1 || true
+
+    if ((drop_entry)); then
+        # KeePassXC moves a removed entry to the recycle bin if the database
+        # has one, so this is recoverable there until the bin is emptied.
+        run_kp rm "$db" "$entry" || kp_die "could not remove '$entry' from $db"
+        info "removed entry '$entry'"
+    fi
+    KP_PW=""
+
+    # The private key gets the same treatment it would get from `drop`: there
+    # is no sense in overwriting a key when it moves into the vault but not
+    # when it is thrown away. Neither the public half nor the config is secret.
+    if [[ -f $key ]]; then secure_rm "$key"; fi
+    rm -f "$key.pub" "$(conffile "$name")"
     info "removed $name"
+
+    if [[ -n $db ]] && ((have_entry)) && ((!drop_entry)); then
+        info "note: '$entry' was kept; while it is there, unlocking $db loads that key into the agent again"
+    elif [[ -z $db ]]; then
+        info "note: the KeePassXC entry '$entry', if there is one, was left alone; while it is there, unlocking the database loads that key into the agent again"
+        info "to have it removed as well: skm rm $name <database.kdbx>"
+    fi
 }
 
 # The public key is what agent mode points ssh at, so it has to be on disk for

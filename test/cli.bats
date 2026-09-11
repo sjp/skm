@@ -551,6 +551,45 @@ Include other.d/*.conf
     assert_file "$(keyfile box)"
 }
 
+@test "rm shreds the private key rather than plain-deleting it" {
+    add_host box
+    trace_setup shred
+
+    PATH="$TRACE_BIN:$PATH" run skm_answer y -- rm box
+    assert_ok
+    assert_traced "shred -u $(keyfile box)"
+}
+
+@test "rm closes the multiplexed connection while the config still names it" {
+    add_host box
+    trace_setup ssh
+
+    # ssh works out the socket path from the fragment, so the shutdown has to
+    # happen before the fragment goes: the witness proves it was still there.
+    SKM_TRACE_WITNESS=$(conffile box) PATH="$TRACE_BIN:$PATH" \
+        run skm_answer y -- rm box
+    assert_ok
+    assert_traced "ssh -O exit box"
+    assert_traced "witness $(conffile box)"
+}
+
+@test "rm names the vault entry it left behind when no database is given" {
+    add_host box
+    run skm_answer y -- rm box
+    assert_ok
+    assert_output_has "'SSH Keys/box'"
+    assert_output_has "skm rm box <database.kdbx>"
+}
+
+@test "rm rejects a database that is not there and keeps the host" {
+    add_host box
+    run skm rm box "$SKM_TMP/missing.kdbx"
+    assert_fails
+    assert_output_has "no such database"
+    assert_file "$(keyfile box)"
+    assert_file "$(conffile box)"
+}
+
 # ------------------------------------------------------------- dispatch
 
 @test "no arguments print the command summary" {

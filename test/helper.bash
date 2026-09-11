@@ -40,6 +40,35 @@ skm_setup() {
     chmod +x "$NOCHMOD/chmod"
 }
 
+# A PATH entry of recording stubs: each named command writes its arguments to
+# $TRACE_LOG and does nothing else, so a test can see which external commands a
+# run reached for. SKM_TRACE_WITNESS names a file a stub also reports on, as
+# "witness <path>", when it is still there at the moment the stub ran -- which
+# is how a test pins the order of a call against a deletion:
+#     trace_setup ssh
+#     SKM_TRACE_WITNESS=$(conffile box) PATH="$TRACE_BIN:$PATH" run skm_answer y -- rm box
+#     assert_traced "ssh -O exit box"
+trace_setup() {   # command...
+    TRACE_BIN="$SKM_TMP/trace-bin"
+    TRACE_LOG="$SKM_TMP/trace-log"
+    mkdir -p "$TRACE_BIN"
+    : > "$TRACE_LOG"
+    local cmd
+    for cmd in "$@"; do
+        {
+            printf '#!/bin/sh\n'
+            printf 'printf "%s %%s\\n" "$*" >> "%s"\n' "$cmd" "$TRACE_LOG"
+            # The stub's own text, not this shell's: nothing here is meant to expand.
+            # shellcheck disable=SC2016
+            printf '[ -n "${SKM_TRACE_WITNESS:-}" ] && [ -e "$SKM_TRACE_WITNESS" ] &&\n'
+            # shellcheck disable=SC2016
+            printf '    printf "witness %%s\\n" "$SKM_TRACE_WITNESS" >> "%s"\n' "$TRACE_LOG"
+            printf 'exit 0\n'
+        } > "$TRACE_BIN/$cmd"
+        chmod +x "$TRACE_BIN/$cmd"
+    done
+}
+
 skm_teardown() {
     # Scope tests start real agents; leaving them behind would leak processes
     # holding keys for as long as the machine is up.
@@ -140,6 +169,11 @@ vault_export_key() {
         "id_ed25519_$name" "$dest" >/dev/null 2>&1
 }
 
+# Whether the database still holds an entry at all, attachments aside.
+vault_entry_exists() {
+    printf '%s\n' "$DB_PW" | kp_cli show "$DB" "$1" >/dev/null 2>&1
+}
+
 # The Password field of an entry: where KeePassXC's agent looks for the
 # passphrase that decrypts the key stored alongside it.
 vault_password() {
@@ -212,6 +246,12 @@ assert_output_lacks() {
             return 1 ;;
     esac
     return 0
+}
+
+assert_traced() {
+    grep -qxF -- "$1" "$TRACE_LOG" && return 0
+    printf 'expected the run to call: %s\n--- calls ---\n%s\n' "$1" "$(cat "$TRACE_LOG")" >&2
+    return 1
 }
 
 assert_file() {

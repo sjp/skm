@@ -485,6 +485,59 @@ teardown() { skm_teardown; }
     assert_equal "$(identity_file box)" "$(keyfile box).pub"
 }
 
+# -------------------------------------------------------------------- rm
+
+@test "rm deletes the vault entry when that is asked for as well" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+
+    run skm_answer "$DB_PW" y y -- rm box "$DB"
+    assert_ok
+    assert_output_has "removed entry 'SSH Keys/box'"
+    assert_no_file "$(keyfile box)"
+    assert_no_file "$(conffile box)"
+
+    run vault_entry_exists "SSH Keys/box"
+    assert_fails
+}
+
+@test "rm keeps the vault entry when only the local half is wanted gone" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+
+    run skm_answer "$DB_PW" y n -- rm box "$DB"
+    assert_ok
+    assert_output_has "was kept"
+    assert_no_file "$(keyfile box)"
+
+    run vault_entry_exists "SSH Keys/box"
+    assert_ok
+}
+
+@test "rm reports a host the vault does not hold instead of offering to remove it" {
+    add_host box
+
+    run skm_answer "$DB_PW" y -- rm box "$DB"
+    assert_ok
+    assert_output_has "no entry 'SSH Keys/box'"
+    assert_output_lacks "also delete"
+    assert_no_file "$(keyfile box)"
+}
+
+@test "a wrong password stops rm with the host and the entry still there" {
+    add_host box
+    skm_answer "$DB_PW" -- export box "$DB" >/dev/null
+
+    run skm_answer wrong -- rm box "$DB"
+    assert_fails
+    assert_output_has "wrong password"
+    assert_file "$(keyfile box)"
+    assert_file "$(conffile box)"
+
+    run vault_entry_exists "SSH Keys/box"
+    assert_ok
+}
+
 # ---------------------------------------------------------------- status
 
 @test "status reads the vault and confirms the two copies are the same key" {
